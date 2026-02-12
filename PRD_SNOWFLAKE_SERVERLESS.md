@@ -1,0 +1,815 @@
+# PRD: Snowflake Serverless Compute Platform
+
+**Author:** Muzzammil Imam
+**Status:** Draft
+**Last Updated:** February 2026
+**Stakeholders:** SPCS, Notebooks, Streamlit, Cortex, Platform Engineering
+
+---
+
+## 1. Executive Summary
+
+### 1.1 Problem Statement
+
+Internal Snowflake teams (Notebooks vNext, Streamlit/SiS, Cortex) spend significant engineering effort managing SPCS infrastructure instead of building product features. Currently, deploying code to SPCS requires:
+
+- Writing 50+ lines of ServiceSpec YAML
+- Creating and managing compute pools
+- Building, pushing, and versioning container images
+- Implementing token refresh logic (60-min OAuth expiry)
+- Estimating CPU/memory/GPU requirements
+
+**This infrastructure burden slows down development and creates inconsistent patterns across teams.**
+
+### 1.2 Proposed Solution
+
+Build a **Modal.ai-style serverless interface** that lets developers:
+
+1. Write code in any language
+2. Decorate functions with resource requirements
+3. Deploy instantly with a single command
+4. Get endpoints automatically
+
+The platform handles all infrastructure behind the scenes.
+
+### 1.3 Success Metrics
+
+| Metric | Current | Target |
+|--------|---------|--------|
+| Lines of code to deploy | 50+ | 5 |
+| Time to first deployment | 30+ minutes | < 1 minute |
+| Infrastructure concepts to learn | 8+ | 2 |
+| Internal team adoption | 0% | 80% in 6 months |
+
+---
+
+## 2. Background & Motivation
+
+### 2.1 Current State
+
+Teams integrating with SPCS must manage:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    DEVELOPER RESPONSIBILITIES                │
+├─────────────────────────────────────────────────────────────┤
+│  1. Compute Pool         CREATE COMPUTE POOL, sizing, DDL   │
+│  2. Container Image      Dockerfile, build, push, version   │
+│  3. ServiceSpec YAML     containers, endpoints, volumes...  │
+│  4. Service Creation     CREATE SERVICE SQL                 │
+│  5. Token Management     60-min refresh logic               │
+│  6. Endpoint Config      public/private, CORS, auth         │
+│  7. Scaling              min/max nodes, auto-suspend        │
+│  8. Monitoring           logs, metrics, health checks       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Pain Points from Research
+
+| Pain Point | Severity | Evidence |
+|------------|----------|----------|
+| ServiceSpec complexity | High | 50+ lines for simple service |
+| Compute pool management | High | Manual DDL, sizing guesswork |
+| Image management | High | DevOps overhead for every change |
+| Token refresh | Medium | Session failures in production |
+| Resource estimation | Medium | Over/under provisioning |
+| Cold start | Medium | Minutes to start, poor UX |
+
+### 2.3 What Works Well
+
+**Cortex Search** uses a simplified pattern that abstracts infrastructure:
+
+```sql
+CREATE CORTEX SEARCH SERVICE my_search
+  ON text_column
+  WAREHOUSE = my_warehouse
+  AS SELECT * FROM my_table;
+```
+
+No compute pools. No ServiceSpec. No images. **This is the model to follow.**
+
+---
+
+## 3. Goals & Non-Goals
+
+### 3.1 Goals
+
+| Goal | Description |
+|------|-------------|
+| **G1: Zero Infrastructure** | Developers never see compute pools, ServiceSpec, or images |
+| **G2: Code-First** | Write code → deploy → get endpoint. That's it. |
+| **G3: Any Language** | Python native, containers for Go/Rust/Java/etc. |
+| **G4: Instant Deploy** | < 1 minute from code change to running endpoint |
+| **G5: Snowflake Native** | Automatic session, data access, secrets, auth |
+| **G6: Production Ready** | Auto-scaling, monitoring, cost attribution built-in |
+
+### 3.2 Non-Goals (V1)
+
+| Non-Goal | Rationale |
+|----------|-----------|
+| Replace SPCS entirely | Power users may still need direct SPCS access |
+| Support all SPCS features | Focus on 80% use case first |
+| Multi-cloud parity | Start with AWS, expand later |
+| Custom networking | Use standard Snowflake networking |
+
+---
+
+## 4. User Personas
+
+### 4.1 Primary: Internal Platform Teams
+
+**Notebooks vNext Team**
+- Needs: Deploy notebook runtimes, GPU support, long sessions
+- Pain: ServiceSpec complexity, token refresh, per-user isolation
+
+**Streamlit/SiS Team**
+- Needs: Deploy Streamlit apps, fast cold start, concurrent users
+- Pain: Feature flags, compute pool management, scaling
+
+**Cortex Team**
+- Needs: Deploy ML models, inference endpoints, batch jobs
+- Pain: GPU provisioning, resource estimation, image management
+
+### 4.2 Secondary: Snowflake Customers (Future)
+
+- Data scientists deploying ML models
+- App developers building internal tools
+- Analysts creating dashboards
+
+---
+
+## 5. Proposed Solution
+
+### 5.1 Core Concept
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         DEVELOPER                            │
+│                                                              │
+│   @sf.function(cpu=2, memory="4GB")                         │
+│   def my_function(data):                                     │
+│       return process(data)                                   │
+│                                                              │
+│   endpoint = sf.deploy(my_function)                          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    PLATFORM (INVISIBLE)                      │
+├─────────────────────────────────────────────────────────────┤
+│  • Analyze code, detect dependencies                         │
+│  • Build container image automatically                       │
+│  • Generate ServiceSpec from decorator                       │
+│  • Select/create compute pool                                │
+│  • Deploy service, wait for ready                            │
+│  • Generate endpoint URL with auth                           │
+│  • Handle token refresh transparently                        │
+│  • Auto-scale based on load                                  │
+│  • Track costs per function/user                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 API Design
+
+#### 5.2.1 Core Decorators
+
+```python
+import snowflake.serverless as sf
+
+# Serverless function endpoint
+@sf.function(
+    cpu=2,              # vCPUs (0.5 to 16)
+    memory="4GB",       # Memory (1GB to 64GB)
+    gpu="A10G",         # Optional: A10G, H100, None
+    timeout=300,        # Max execution seconds
+    secrets=["api_key"] # Snowflake secrets to inject
+)
+def my_function(data: dict) -> dict:
+    return process(data)
+
+# Streamlit app
+@sf.app(
+    cpu=1,
+    memory="2GB",
+    concurrent_users=10
+)
+def my_streamlit_app():
+    import streamlit as st
+    st.title("My App")
+
+# Scheduled batch job
+@sf.job(
+    cpu=8,
+    memory="32GB",
+    gpu="H100",
+    schedule="0 0 * * *"  # Cron: daily at midnight
+)
+def nightly_training():
+    train_model()
+
+# Long-running service
+@sf.service(
+    cpu=2,
+    memory="4GB",
+    min_instances=1,
+    max_instances=10
+)
+def my_api_server():
+    from flask import Flask
+    app = Flask(__name__)
+    # ...
+```
+
+#### 5.2.2 Resource Tiers (Alternative to Explicit Resources)
+
+```python
+# Instead of specifying exact resources, use tiers
+@sf.function(tier="medium")
+def my_function(data):
+    return process(data)
+
+@sf.function(tier="gpu-small")
+def ml_inference(data):
+    return model.predict(data)
+```
+
+| Tier | CPU | Memory | GPU | Monthly Cost Est. |
+|------|-----|--------|-----|-------------------|
+| `xs` | 0.5 | 1 GB | - | $5 |
+| `small` | 1 | 2 GB | - | $10 |
+| `medium` | 2 | 4 GB | - | $20 |
+| `large` | 4 | 16 GB | - | $50 |
+| `xl` | 8 | 32 GB | - | $100 |
+| `gpu-small` | 4 | 16 GB | A10G | $150 |
+| `gpu-large` | 8 | 32 GB | A10G x4 | $400 |
+| `gpu-xl` | 16 | 64 GB | H100 | $800 |
+
+#### 5.2.3 Deployment Methods
+
+```python
+# Deploy decorated function
+endpoint = sf.deploy(my_function)
+
+# Deploy from container image (any language)
+endpoint = sf.container(
+    image="my-go-service:latest",
+    port=8080,
+    tier="medium"
+)
+
+# Deploy from stage
+endpoint = sf.from_stage(
+    stage="@my_code/app",
+    entrypoint="main.py",
+    tier="large"
+)
+
+# Deploy notebook
+notebook = sf.notebook(
+    source="@notebooks/analysis.ipynb",
+    tier="gpu-small"
+)
+```
+
+#### 5.2.4 Endpoint Operations
+
+```python
+# Get endpoint info
+print(endpoint.url)          # https://xxx.snowflakecomputing.app
+print(endpoint.status)       # READY, STARTING, FAILED
+print(endpoint.logs())       # Container logs
+
+# Call endpoint
+result = endpoint.call({"input": "data"})
+
+# Async call
+future = endpoint.call_async({"input": "data"})
+result = future.result()
+
+# Manage lifecycle
+endpoint.scale(min_instances=2, max_instances=10)
+endpoint.stop()
+endpoint.start()
+endpoint.delete()
+
+# Get metrics
+print(endpoint.metrics())    # Invocations, latency, errors, cost
+```
+
+### 5.3 Snowflake Integration
+
+```python
+@sf.function(tier="medium")
+def query_and_process():
+    # Snowflake session is automatically available
+    df = session.sql("SELECT * FROM my_table").to_pandas()
+    return process(df)
+
+@sf.function(tier="medium", secrets=["openai_key"])
+def call_llm():
+    import os
+    # Secrets automatically injected as env vars
+    api_key = os.environ["OPENAI_KEY"]
+    return call_openai(api_key)
+```
+
+### 5.4 Multi-Language Support
+
+#### Python (Native - Zero Config)
+```python
+@sf.function(tier="medium")
+def python_function(data):
+    import pandas as pd
+    return pd.DataFrame(data).to_dict()
+```
+
+#### Container (Any Language)
+```python
+# Go, Rust, Java, Node.js, etc.
+endpoint = sf.container(
+    image="my-rust-service:latest",
+    port=8080,
+    tier="medium",
+    env={"LOG_LEVEL": "debug"}
+)
+```
+
+#### Dockerfile (Build from Source)
+```python
+endpoint = sf.container(
+    dockerfile="./Dockerfile",
+    context="./src",
+    tier="medium"
+)
+```
+
+---
+
+## 6. Technical Architecture
+
+### 6.1 System Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      SNOWFLAKE SERVERLESS                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌───────────────┐    ┌───────────────┐    ┌──────────────┐ │
+│  │   SDK/CLI     │───▶│  Control Plane │───▶│   SPCS       │ │
+│  │               │    │               │    │   (Backend)  │ │
+│  │ • Decorators  │    │ • Deploy API  │    │              │ │
+│  │ • sf.deploy() │    │ • Image Build │    │ • Services   │ │
+│  │ • Endpoint    │    │ • Spec Gen    │    │ • Pools      │ │
+│  │   client      │    │ • Pool Mgmt   │    │ • Endpoints  │ │
+│  └───────────────┘    └───────────────┘    └──────────────┘ │
+│                              │                               │
+│                              ▼                               │
+│                    ┌───────────────┐                        │
+│                    │  Shared Infra  │                        │
+│                    │               │                        │
+│                    │ • Image Reg   │                        │
+│                    │ • Pool Fleet  │                        │
+│                    │ • Warm Pools  │                        │
+│                    │ • Metrics     │                        │
+│                    └───────────────┘                        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 Deployment Flow
+
+```
+1. Developer calls sf.deploy(my_function)
+   │
+   ▼
+2. SDK analyzes function
+   • Parse decorator parameters
+   • Detect Python dependencies (imports)
+   • Hash code for caching
+   │
+   ▼
+3. Control Plane receives deploy request
+   • Validate parameters
+   • Check quotas/limits
+   │
+   ▼
+4. Image Builder (if needed)
+   • Generate Dockerfile from dependencies
+   • Build container image
+   • Push to internal registry
+   • Cache for future deploys
+   │
+   ▼
+5. ServiceSpec Generator
+   • Create ContainerSpec from image + resources
+   • Create EndpointSpec for HTTP
+   • Add secrets, volumes as needed
+   │
+   ▼
+6. Pool Manager
+   • Find existing pool with capacity
+   • Or allocate from warm pool fleet
+   • Or create new pool (fallback)
+   │
+   ▼
+7. Service Deployer
+   • Call SYSTEM$CREATE_SERVICE internally
+   • Wait for READY state
+   • Handle retries/failures
+   │
+   ▼
+8. Endpoint Manager
+   • Generate unique URL
+   • Configure Snowflake OAuth
+   • Register in service directory
+   │
+   ▼
+9. Return endpoint to developer
+   • endpoint.url ready to use
+   • Monitoring automatically enabled
+```
+
+### 6.3 Warm Pool Fleet
+
+To minimize cold start time, maintain pre-provisioned pools:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      WARM POOL FLEET                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Tier: small (CPU_X64_XS)     │  Pool Count: 10             │
+│  ──────────────────────────   │  Idle Nodes: 15             │
+│                               │  Utilization: 60%           │
+│                                                              │
+│  Tier: medium (CPU_X64_S)     │  Pool Count: 8              │
+│  ──────────────────────────   │  Idle Nodes: 12             │
+│                               │  Utilization: 70%           │
+│                                                              │
+│  Tier: gpu-small (GPU_NV_S)   │  Pool Count: 4              │
+│  ──────────────────────────   │  Idle Nodes: 4              │
+│                               │  Utilization: 50%           │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+
+Auto-scaling rules:
+• If utilization > 80%: Add pools
+• If utilization < 30%: Remove pools
+• Always maintain minimum idle capacity per tier
+```
+
+### 6.4 Token Management
+
+Platform handles OAuth token refresh transparently:
+
+```python
+# Internal token manager (invisible to developer)
+class TokenManager:
+    def __init__(self, service_id):
+        self.service_id = service_id
+        self.token_path = "/snowflake/session/token"
+        self.refresh_interval = 50 * 60  # 50 min (before 60 min expiry)
+
+    def start_refresh_loop(self):
+        """Background thread refreshes token before expiry."""
+        while True:
+            time.sleep(self.refresh_interval)
+            self._refresh_token()
+
+    def _refresh_token(self):
+        """Get new token and update file."""
+        new_token = self._request_new_token()
+        with open(self.token_path, 'w') as f:
+            f.write(new_token)
+```
+
+---
+
+## 7. Detailed Requirements
+
+### 7.1 Functional Requirements
+
+#### FR1: Function Deployment
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR1.1 | Deploy Python function with `@sf.function` decorator | P0 |
+| FR1.2 | Auto-detect and install Python dependencies | P0 |
+| FR1.3 | Support CPU and memory specification | P0 |
+| FR1.4 | Support GPU specification (A10G, H100) | P0 |
+| FR1.5 | Support secrets injection from Snowflake | P0 |
+| FR1.6 | Support timeout configuration | P1 |
+| FR1.7 | Support environment variables | P1 |
+
+#### FR2: App Deployment (Streamlit)
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR2.1 | Deploy Streamlit app with `@sf.app` decorator | P0 |
+| FR2.2 | Support concurrent user limit | P0 |
+| FR2.3 | Auto-scaling based on user count | P1 |
+| FR2.4 | Session affinity for stateful apps | P2 |
+
+#### FR3: Notebook Deployment
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR3.1 | Deploy notebook from stage with `sf.notebook()` | P0 |
+| FR3.2 | Support GPU for ML notebooks | P0 |
+| FR3.3 | Persistent storage for notebook state | P1 |
+| FR3.4 | Collaborative editing (multiple users) | P2 |
+
+#### FR4: Job Deployment
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR4.1 | Deploy scheduled job with `@sf.job` decorator | P1 |
+| FR4.2 | Support cron schedule syntax | P1 |
+| FR4.3 | Job history and logs | P1 |
+| FR4.4 | Manual job trigger | P1 |
+
+#### FR5: Container Deployment
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR5.1 | Deploy from container image with `sf.container()` | P1 |
+| FR5.2 | Deploy from Dockerfile | P2 |
+| FR5.3 | Support any language (Go, Rust, Java, etc.) | P1 |
+
+#### FR6: Endpoint Management
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR6.1 | Generate unique HTTPS endpoint URL | P0 |
+| FR6.2 | Snowflake OAuth authentication | P0 |
+| FR6.3 | Endpoint status (READY, STARTING, FAILED) | P0 |
+| FR6.4 | Container logs access | P0 |
+| FR6.5 | Stop/start/delete operations | P0 |
+| FR6.6 | Manual scaling (min/max instances) | P1 |
+
+#### FR7: Snowflake Integration
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR7.1 | Automatic Snowflake session in functions | P0 |
+| FR7.2 | Access to tables, stages, warehouses | P0 |
+| FR7.3 | Secrets from Snowflake secret manager | P0 |
+| FR7.4 | Inherit caller's role and permissions | P0 |
+
+### 7.2 Non-Functional Requirements
+
+#### NFR1: Performance
+| ID | Requirement | Target |
+|----|-------------|--------|
+| NFR1.1 | Cold start time (warm pool) | < 10 seconds |
+| NFR1.2 | Cold start time (new pool) | < 60 seconds |
+| NFR1.3 | Deploy time (cached image) | < 30 seconds |
+| NFR1.4 | Deploy time (new image) | < 2 minutes |
+| NFR1.5 | Endpoint latency overhead | < 50ms |
+
+#### NFR2: Reliability
+| ID | Requirement | Target |
+|----|-------------|--------|
+| NFR2.1 | Service availability | 99.9% |
+| NFR2.2 | Deployment success rate | 99% |
+| NFR2.3 | Auto-recovery from failures | < 30 seconds |
+
+#### NFR3: Scalability
+| ID | Requirement | Target |
+|----|-------------|--------|
+| NFR3.1 | Max concurrent functions per account | 1000 |
+| NFR3.2 | Max instances per function | 100 |
+| NFR3.3 | Auto-scale response time | < 30 seconds |
+
+#### NFR4: Security
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| NFR4.1 | All endpoints require Snowflake auth | P0 |
+| NFR4.2 | Network isolation between functions | P0 |
+| NFR4.3 | Secrets encrypted at rest and in transit | P0 |
+| NFR4.4 | Audit logging for all operations | P0 |
+
+---
+
+## 8. User Stories
+
+### 8.1 Notebooks Team
+
+**US1: Deploy Notebook Runtime**
+```
+As a Notebooks vNext developer,
+I want to deploy a notebook runtime with GPU support,
+So that users can run ML workloads without infrastructure setup.
+
+Acceptance Criteria:
+- Deploy with sf.notebook(source="@stage/nb.ipynb", tier="gpu-small")
+- Get working URL in < 1 minute
+- GPU is available in notebook environment
+- Snowflake session works automatically
+```
+
+### 8.2 Streamlit Team
+
+**US2: Deploy Streamlit App**
+```
+As a Streamlit developer,
+I want to deploy an app that scales with user count,
+So that I don't have to manage compute pools manually.
+
+Acceptance Criteria:
+- Deploy with @sf.app(concurrent_users=50)
+- App auto-scales from 1 to N instances
+- Cold start < 10 seconds for new users
+- Token refresh is automatic (no session timeouts)
+```
+
+### 8.3 Cortex Team
+
+**US3: Deploy ML Inference Endpoint**
+```
+As a Cortex developer,
+I want to deploy an ML model as a serverless endpoint,
+So that I can serve predictions without managing infrastructure.
+
+Acceptance Criteria:
+- Deploy with @sf.function(tier="gpu-small")
+- Endpoint handles concurrent requests
+- Auto-scales based on load
+- Cost tracked per invocation
+```
+
+### 8.4 General
+
+**US4: Deploy Any Container**
+```
+As a developer using Go/Rust/Java,
+I want to deploy my container without learning SPCS,
+So that I can use my preferred language.
+
+Acceptance Criteria:
+- Deploy with sf.container(image="my-go:latest", port=8080)
+- Works with any HTTP server
+- Same endpoint/scaling features as Python
+```
+
+---
+
+## 9. Rollout Plan
+
+### 9.1 Phase 1: Internal Alpha (Month 1-2)
+
+**Scope:**
+- `@sf.function` decorator (Python only)
+- Basic tiers (small, medium, large)
+- Manual deploy via SDK
+- Single region (AWS us-west-2)
+
+**Users:**
+- SPCS team (dogfooding)
+- 2-3 volunteer teams
+
+**Success Criteria:**
+- 10+ functions deployed
+- < 2 minute deploy time
+- No major bugs
+
+### 9.2 Phase 2: Internal Beta (Month 3-4)
+
+**Scope:**
+- `@sf.app` for Streamlit
+- `sf.notebook()` for notebooks
+- GPU tiers (gpu-small, gpu-large)
+- Auto-scaling
+- Multi-region
+
+**Users:**
+- Notebooks vNext team
+- Streamlit team
+- Cortex team
+
+**Success Criteria:**
+- 3+ teams actively using
+- 50% reduction in SPCS boilerplate
+- P0 features working reliably
+
+### 9.3 Phase 3: Internal GA (Month 5-6)
+
+**Scope:**
+- `@sf.job` for scheduled jobs
+- `sf.container()` for any language
+- Cost attribution dashboard
+- Full monitoring/alerting
+
+**Users:**
+- All internal teams
+
+**Success Criteria:**
+- 80% of new deployments use serverless
+- < 1 minute average deploy time
+- 90% developer satisfaction
+
+### 9.4 Phase 4: Customer Preview (Month 7+)
+
+**Scope:**
+- Public documentation
+- Snowsight integration
+- Billing integration
+- Support playbooks
+
+**Users:**
+- Select customer beta
+
+---
+
+## 10. Open Questions
+
+| # | Question | Owner | Status |
+|---|----------|-------|--------|
+| 1 | Should we build on existing SPCS or create new backend? | Platform | Open |
+| 2 | How to handle image caching across regions? | Platform | Open |
+| 3 | What's the billing model? Per-invocation vs per-hour? | PM | Open |
+| 4 | How to handle VPC/PrivateLink for enterprise customers? | Security | Open |
+| 5 | Should functions share pools or have dedicated pools? | Platform | Open |
+| 6 | How to handle large dependencies (ML libraries)? | Platform | Open |
+| 7 | What's the migration path for existing SPCS services? | PM | Open |
+| 8 | How to expose this to external customers? | PM | Open |
+
+---
+
+## 11. Risks & Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| Cold start too slow | Medium | High | Warm pool fleet, image caching |
+| Image build failures | Medium | Medium | Curated base images, clear errors |
+| Cost overruns (pools) | Medium | Medium | Aggressive auto-suspend, quotas |
+| Security vulnerabilities | Low | High | Network isolation, code scanning |
+| Adoption resistance | Low | Medium | Migration tools, documentation |
+
+---
+
+## 12. Dependencies
+
+| Dependency | Team | Status |
+|------------|------|--------|
+| SPCS service creation APIs | SPCS | Available |
+| Compute pool management | SPCS | Available |
+| Image registry | Platform | Available |
+| Snowflake secrets | Security | Available |
+| OAuth token refresh | Auth | Needs enhancement |
+| Cost attribution APIs | Billing | Needs development |
+
+---
+
+## 13. Appendix
+
+### A. Current vs Proposed Comparison
+
+**Current (50+ lines):**
+```python
+# 1. Create compute pool
+# CREATE COMPUTE POOL my_pool INSTANCE_FAMILY=CPU_X64_S...
+
+# 2. Build image
+# docker build && docker push
+
+# 3. Write ServiceSpec
+service_spec = ServiceSpec()
+service_spec.add_container(ContainerSpec(
+    name="main",
+    image="registry/my-image:latest",
+    resources=ResourceSpec(
+        requests={"memory": "4Gi", "cpu": "2"},
+        limits={"memory": "4Gi", "cpu": "2"}
+    ),
+    # ... 30 more lines
+))
+service_spec.add_endpoint(EndpointSpec(...))
+service_spec.add_volume(VolumeSpec(...))
+
+# 4. Create service
+cursor.execute(f"CREATE SERVICE ... FROM SPECIFICATION $$...$$")
+
+# 5. Wait for ready
+# 6. Get endpoint URL
+```
+
+**Proposed (5 lines):**
+```python
+import snowflake.serverless as sf
+
+@sf.function(cpu=2, memory="4GB")
+def my_function(data):
+    return process(data)
+
+endpoint = sf.deploy(my_function)
+```
+
+### B. Glossary
+
+| Term | Definition |
+|------|------------|
+| SPCS | Snowpark Container Services |
+| ServiceSpec | YAML specification for SPCS services |
+| Compute Pool | Group of compute nodes for running containers |
+| Warm Pool | Pre-provisioned pool for fast cold starts |
+| Tier | Predefined resource configuration (small/medium/large) |
+
+---
+
+*Document Version: 1.0*
+*Created: February 2026*
