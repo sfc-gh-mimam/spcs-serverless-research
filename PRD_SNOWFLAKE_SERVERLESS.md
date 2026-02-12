@@ -715,18 +715,273 @@ Acceptance Criteria:
 
 ---
 
-## 10. Open Questions
+## 10. Open Questions & Options
 
-| # | Question | Owner | Status |
-|---|----------|-------|--------|
-| 1 | Should we build on existing SPCS or create new backend? | Platform | Open |
-| 2 | How to handle image caching across regions? | Platform | Open |
-| 3 | What's the billing model? Per-invocation vs per-hour? | PM | Open |
-| 4 | How to handle VPC/PrivateLink for enterprise customers? | Security | Open |
-| 5 | Should functions share pools or have dedicated pools? | Platform | Open |
-| 6 | How to handle large dependencies (ML libraries)? | Platform | Open |
-| 7 | What's the migration path for existing SPCS services? | PM | Open |
-| 8 | How to expose this to external customers? | PM | Open |
+### Q1: Should we build on existing SPCS or create new backend?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Layer on SPCS** | Serverless SDK generates ServiceSpec, uses existing SPCS APIs | Faster to build, leverages existing infra, lower risk | Inherits SPCS limitations, may hit performance ceiling |
+| **B: New Backend** | Purpose-built serverless runtime, bypass SPCS | Optimized for use case, no legacy constraints | 6+ months longer, duplicate infrastructure, higher risk |
+| **C: Hybrid** | New control plane, reuse SPCS compute/networking | Best of both, can migrate incrementally | Complexity of two systems, unclear ownership |
+
+**Recommendation:** _TBD - needs architecture review_
+
+---
+
+### Q2: How to handle image caching across regions?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Global Registry** | Single registry, replicate to all regions | Simple model, consistent | Cross-region latency, replication costs |
+| **B: Regional Registries** | Registry per region, sync on-demand | Fast local pulls, cost efficient | Complexity, cold start on first regional deploy |
+| **C: Edge Caching** | CDN-style caching at edge locations | Fastest pulls, automatic | Infrastructure cost, cache invalidation complexity |
+| **D: Customer-owned** | Customers use their own registries | No storage cost for us | Poor UX, security concerns, slower deploys |
+
+**Recommendation:** _TBD - needs cost analysis_
+
+---
+
+### Q3: What's the billing model?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Per-invocation** | Charge per function call (like Lambda) | Pay for what you use, simple to understand | Unpredictable costs, gaming concerns |
+| **B: Per-hour (compute time)** | Charge for actual compute seconds | Aligns with cost, familiar model | Complex metering, idle time debates |
+| **C: Per-hour (wall clock)** | Charge while endpoint exists | Predictable, simple billing | Customers pay for idle, less competitive |
+| **D: Tiered subscription** | Monthly tiers with included compute | Predictable revenue, simple | May not fit all use cases |
+| **E: Hybrid** | Base fee + per-invocation overage | Predictable base, scales with usage | Complex to explain |
+
+**Pricing Comparison:**
+| Provider | Model | Example: 1M invocations/month, 100ms avg |
+|----------|-------|------------------------------------------|
+| AWS Lambda | Per-invocation + compute | ~$20/month |
+| Modal.ai | Per-second compute | ~$30/month |
+| Google Cloud Run | Per-request + compute | ~$25/month |
+| Snowflake (current SPCS) | Per-hour pool | ~$200/month (always-on) |
+
+**Recommendation:** _TBD - needs competitive analysis_
+
+---
+
+### Q4: How to handle VPC/PrivateLink for enterprise customers?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Public endpoints only (V1)** | All endpoints are public HTTPS | Simple, fast to market | Blocks enterprise customers |
+| **B: PrivateLink per function** | Each function gets PrivateLink endpoint | Maximum isolation | Expensive, slow provisioning |
+| **C: Shared PrivateLink gateway** | One PrivateLink per account, routes to functions | Cost efficient, enterprise ready | Routing complexity |
+| **D: VPC peering** | Direct VPC connection to Snowflake | Best performance | Complex setup, not self-service |
+
+**Recommendation:** _TBD - needs security review_
+
+---
+
+### Q5: Should functions share pools or have dedicated pools?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Shared pools (multi-tenant)** | All functions share pool fleet | Cost efficient, fast cold start | Noisy neighbor, security isolation |
+| **B: Dedicated pools (per-account)** | Each account gets own pools | Full isolation, predictable | Expensive, slow cold start |
+| **C: Dedicated pools (per-function)** | Each function gets own pool | Maximum isolation | Very expensive, wasteful |
+| **D: Hybrid** | Shared by default, dedicated on request | Flexibility | Complexity, two code paths |
+| **E: Tiered isolation** | Free=shared, Pro=account-dedicated, Enterprise=function-dedicated | Aligns with pricing | Complex operations |
+
+**Isolation Considerations:**
+- CPU/memory: Containers provide isolation
+- Network: Need network policies
+- Storage: Separate volumes required
+- Secrets: Must not leak between tenants
+
+**Recommendation:** _TBD - needs security review_
+
+---
+
+### Q6: How to handle large dependencies (ML libraries)?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Build from scratch** | Install all deps at build time | Clean, reproducible | Slow builds (10+ min for PyTorch) |
+| **B: Curated base images** | Pre-built images with common ML libs | Fast builds, optimized | Limited flexibility, maintenance burden |
+| **C: Layer caching** | Cache dependency layers, rebuild only app code | Fast incremental builds | Storage costs, cache invalidation |
+| **D: Conda environments** | Use existing Snowflake conda integration | Familiar to users | Limited packages, version conflicts |
+| **E: Bring your own image** | Customers provide complete image | Full flexibility | Poor UX, security scanning needed |
+
+**Common ML Dependencies:**
+| Library | Size | Install Time |
+|---------|------|--------------|
+| PyTorch | 2+ GB | 3-5 min |
+| TensorFlow | 1.5 GB | 2-4 min |
+| Transformers | 500 MB | 1-2 min |
+| scikit-learn | 100 MB | 30 sec |
+
+**Recommendation:** _TBD - needs benchmarking_
+
+---
+
+### Q7: What's the migration path for existing SPCS services?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: No migration** | Existing SPCS stays, serverless is new | No disruption | Two systems forever |
+| **B: Manual migration** | Documentation + tools, customers migrate | Low effort for us | Slow adoption, support burden |
+| **C: Automated migration** | Tool converts ServiceSpec to decorators | Easy for customers | Edge cases, may not cover all |
+| **D: Gradual deprecation** | Serverless is default, SPCS deprecated over 2 years | Clean end state | Forcing customers to change |
+| **E: Compatibility layer** | Serverless can run existing ServiceSpecs | No code changes | Complexity, maintaining two APIs |
+
+**Migration Complexity by Service Type:**
+| Service Type | Migration Difficulty | Notes |
+|--------------|---------------------|-------|
+| Simple HTTP endpoint | Easy | Direct mapping to @sf.function |
+| Streamlit app | Easy | Direct mapping to @sf.app |
+| Multi-container | Hard | Need to split or use sf.container |
+| Custom networking | Very Hard | May need manual intervention |
+| Stateful services | Very Hard | Need storage migration |
+
+**Recommendation:** _TBD - needs customer research_
+
+---
+
+### Q8: How to expose this to external customers?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Internal only** | Only for Snowflake internal teams | Lower risk, focused scope | Limited impact |
+| **B: Native Apps only** | Available to Native App developers | Clear use case, controlled | Limited market |
+| **C: All customers (Python SDK)** | pip install snowflake-serverless | Maximum reach | Support burden, abuse risk |
+| **D: Snowsight only** | GUI-based deployment, no SDK | Easy to use, controlled | Limited power users |
+| **E: Phased rollout** | Internal → Native Apps → All customers | Controlled expansion | Slower time to market |
+
+**Customer Segments:**
+| Segment | Need | Fit |
+|---------|------|-----|
+| Data Scientists | Deploy ML models | High |
+| App Developers | Internal tools | High |
+| Data Engineers | Batch jobs | Medium |
+| Analysts | Dashboards | Medium |
+| External Apps | Public APIs | Low (security) |
+
+**Recommendation:** _TBD - needs PM decision_
+
+---
+
+### Q9: What interface style should we prioritize?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Python SDK only** | Decorators + sf.deploy() | Pythonic, Modal-like | Excludes non-Python users |
+| **B: SQL DDL only** | CREATE SERVERLESS FUNCTION... | Snowflake-native | Verbose, not code-first |
+| **C: CLI only** | snow serverless deploy | DevOps friendly | Learning curve |
+| **D: GUI only (Snowsight)** | Point-and-click deployment | Easy onboarding | Limited for power users |
+| **E: All of the above** | SDK, SQL, CLI, GUI | Maximum flexibility | 4x development effort |
+| **F: SDK + SQL** | Python SDK primary, SQL for admin | Best of both | Still 2x effort |
+
+**User Preference by Persona:**
+| Persona | Preferred Interface |
+|---------|-------------------|
+| Data Scientist | Python SDK |
+| ML Engineer | Python SDK + CLI |
+| Data Engineer | SQL + CLI |
+| App Developer | Python SDK |
+| DBA | SQL |
+| Business Analyst | GUI |
+
+**Recommendation:** _TBD - needs user research_
+
+---
+
+### Q10: How should auto-scaling work?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Request-based** | Scale based on pending requests | Responsive, matches load | May over-provision |
+| **B: CPU/Memory-based** | Scale when resources exhausted | Efficient | Slower response to spikes |
+| **C: Predictive** | ML-based prediction of load | Proactive scaling | Complex, may mispredict |
+| **D: Manual only** | User sets min/max, no auto | Predictable costs | Poor UX, over/under provision |
+| **E: Schedule-based** | Scale based on time of day | Predictable | Doesn't handle unexpected load |
+| **F: Hybrid** | Request-based + schedule hints | Flexible | Complex configuration |
+
+**Scaling Parameters:**
+```python
+@sf.function(
+    tier="medium",
+    # Scaling options
+    min_instances=1,      # Always running (warm)
+    max_instances=10,     # Cap for cost control
+    scale_to_zero=True,   # Allow 0 instances when idle
+    target_concurrency=10, # Requests per instance before scaling
+    scale_up_delay=5,     # Seconds before adding instance
+    scale_down_delay=300, # Seconds before removing instance
+)
+```
+
+**Recommendation:** _TBD - needs benchmarking_
+
+---
+
+### Q11: How to handle secrets and credentials?
+
+| Option | Description | Pros | Cons |
+|--------|-------------|------|------|
+| **A: Snowflake Secrets only** | Use existing secret manager | Integrated, secure | Limited to Snowflake secrets |
+| **B: Environment variables** | Pass secrets as env vars | Simple, standard | Less secure, visible in config |
+| **C: External vaults** | HashiCorp Vault, AWS Secrets Manager | Enterprise grade | Complexity, external dependency |
+| **D: Encrypted config** | Encrypted secrets in code/config | Portable | Key management burden |
+| **E: Hybrid** | Snowflake Secrets + external vaults | Flexibility | Complex |
+
+**Secret Injection API:**
+```python
+# Option A: Snowflake Secrets
+@sf.function(secrets=["my_api_key", "db_password"])
+def my_function():
+    key = os.environ["MY_API_KEY"]  # Injected from Snowflake
+
+# Option B: Inline (less secure)
+@sf.function(env={"API_KEY": "sk-xxx"})
+def my_function():
+    key = os.environ["API_KEY"]
+
+# Option C: External vault
+@sf.function(secrets_from="hashicorp://vault/path")
+def my_function():
+    key = os.environ["API_KEY"]
+```
+
+**Recommendation:** _TBD - needs security review_
+
+---
+
+### Q12: What monitoring and observability features are needed?
+
+| Feature | Priority | Options |
+|---------|----------|---------|
+| **Logs** | P0 | Container stdout/stderr, structured JSON |
+| **Metrics** | P0 | Invocations, latency, errors, cost |
+| **Traces** | P1 | OpenTelemetry, Snowflake native |
+| **Alerts** | P1 | Error rate, latency, cost thresholds |
+| **Dashboards** | P2 | Snowsight, Grafana, DataDog |
+| **Profiling** | P2 | CPU, memory, GPU utilization |
+
+**Observability API:**
+```python
+# Get logs
+logs = endpoint.logs(since="1h", level="ERROR")
+
+# Get metrics
+metrics = endpoint.metrics(
+    period="1d",
+    metrics=["invocations", "p99_latency", "error_rate", "cost"]
+)
+
+# Set alerts
+endpoint.alert(
+    name="high_error_rate",
+    condition="error_rate > 0.05",
+    notify=["slack://channel", "email://team@snowflake.com"]
+)
+```
+
+**Recommendation:** _TBD - needs platform review_
 
 ---
 
