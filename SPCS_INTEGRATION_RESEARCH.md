@@ -8,15 +8,44 @@ This document analyzes how internal Snowflake services (Notebooks vNext, Streaml
 
 ## 1. Current Integration Patterns Overview
 
-### 1.1 Service Categories
+### 1.1 All Products Using SPCS/SnowServices
 
-| Service | Integration Type | Complexity | Key Interface |
+| Product | Integration Type | Complexity | Key Interface |
 |---------|-----------------|------------|---------------|
-| Notebooks vNext | Direct SPCS (ServiceSpec) | High | SYSTEM$NOTEBOOKS_VNEXT_CREATE_* |
-| Streamlit/SiS vNext | Direct SPCS (ServiceSpec) | High | SYSTEM$STREAMLIT_BOOTSTRAP |
-| Cortex Search | Managed Service (SQL DDL) | Medium | CREATE CORTEX SEARCH SERVICE |
-| Cortex Agent | Versioned Stage + Orchestrator | Medium | CREATE AGENT + gRPC |
-| Intelligence Agent | Versioned Stage + Mapping | Medium | CREATE SNOWFLAKE INTELLIGENCE |
+| **Notebooks vNext** | Direct SPCS (ServiceSpec) | High | SYSTEM$NOTEBOOKS_VNEXT_CREATE_* |
+| **Streamlit/SiS vNext** | Managed SPCS | High | SYSTEM$STREAMLIT_BOOTSTRAP |
+| **ML Model Serving** | Direct SPCS | High | SYSTEM$DEPLOY_MODEL |
+| **ML Training Jobs** | SPCS Jobs | High | SYSTEM$EXECUTE_ML_JOB |
+| **Cortex Search** | Managed Service | Medium | CREATE CORTEX SEARCH SERVICE |
+| **Cortex Agent** | Versioned Stage + gRPC | Medium | CREATE AGENT |
+| **Intelligence Agent** | Versioned Stage + Mapping | Medium | CREATE SNOWFLAKE INTELLIGENCE |
+| **Native Apps** | SPCS for App Services | High | CREATE SERVICE in App |
+| **Spark Applications** | SPCS Clusters | High | Spark-on-SPCS module |
+| **OpenFlow** | SPCS Integration | Medium | OpenFlow-SPCS API |
+| **Data Sharing Apps** | SPCS Services | Medium | Service in shared context |
+
+### 1.2 Product Categories
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SPCS CONSUMER PRODUCTS                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  INTERACTIVE COMPUTE          │  AI/ML SERVICES                │
+│  ─────────────────────        │  ──────────────                │
+│  • Notebooks vNext            │  • ML Model Serving            │
+│  • Streamlit/SiS vNext        │  • ML Training Jobs            │
+│  • Spark Applications         │  • Cortex Search               │
+│                               │  • Cortex Agent                │
+│                               │  • Intelligence Agent          │
+│                               │                                │
+│  PLATFORM SERVICES            │  EXTENSIBILITY                 │
+│  ─────────────────            │  ─────────────                 │
+│  • Native Apps (NASPCS)       │  • OpenFlow                    │
+│  • Data Sharing Apps          │  • Custom Services             │
+│                               │                                │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ### 1.2 The Problem
 
@@ -70,51 +99,362 @@ class NotebookServiceAPI:
 
 ---
 
-## 3. Streamlit/SiS vNext Integration
+## 3. Streamlit/SiS vNext Integration (Deep Dive)
 
-### 3.1 Service Bootstrap
+### 3.1 Architecture Overview
 
-**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/t_streamlit/test_streamlit_on_spcs_v2.py`
+Streamlit on SPCS uses a **managed service pattern** where the platform handles service creation automatically during bootstrap.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    STREAMLIT ON SPCS V2                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  User Request                                                   │
+│       │                                                         │
+│       ▼                                                         │
+│  SYSTEM$STREAMLIT_BOOTSTRAP(streamlit_name, session_id)        │
+│       │                                                         │
+│       ▼                                                         │
+│  StreamlitBootstrapHandler.getBootstrapAndRunActions()         │
+│       │                                                         │
+│       ├── Check if SPCS v2 runtime enabled                     │
+│       │                                                         │
+│       ▼                                                         │
+│  SpcsInstanceHelpers.createServiceIfNeeded()                   │
+│       │                                                         │
+│       ├── Check for existing StRunningService                  │
+│       ├── Verify service maps to active instance               │
+│       │                                                         │
+│       ▼                                                         │
+│  createServiceViaJob() → SPCS Service Created                  │
+│       │                                                         │
+│       ▼                                                         │
+│  Return bootstrap JSON with endpoint URL                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Service Creation Flow
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/GlobalServices/src/main/java/com/snowflake/app/stplatform/SpcsInstanceHelpers.java`
+
+```java
+// createServiceIfNeeded() - Lines 421-469
+// Ensures a valid and active StRunningService exists for a Streamlit
+public static void createServiceIfNeeded(Streamlit streamlit, Session session, boolean isV2) {
+    // 1. Check for existing StRunningService
+    // 2. Verify service maps to active instance
+    // 3. Create new service via job if no valid service exists
+}
+
+// createServiceViaJob() - Lines 496-612
+// Creates job to ensure service and waits for completion
+// Uses STREAMLIT_SPCS_V2_SERVICE_BOOT_TIMEOUT_MS for timeout
+```
+
+### 3.3 Service Bootstrap System Function
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/GlobalServices/src/main/java/com/snowflake/sql/compiler/semantic/functions/StreamlitFuncs.java`
+
+```java
+// SYSTEM$STREAMLIT_BOOTSTRAP - Line 1479
+// Returns bootstrap JSON with everything needed by Snowsight to launch Streamlit
+// Parameters: streamlit_name, app_view_request_id, is_private_link_request, query_id
+
+// SYSTEM$STREAMLIT_BOOTSTRAP_STARTUP_STATUS - Line 1543
+// Returns warehouse startup status for UI feedback
+
+// SYSTEM$GET_STREAMLIT_API_TOKEN - Line 2187
+// Returns API token for Streamlit access
+```
+
+### 3.4 Runtime Configuration
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/snowfort/testlib/streamlit/constants.py`
 
 ```python
-@CreateAccount.with_args(parameters={
-    "ENABLE_SNOWSERVICES_USER_FACING_FEATURES": True,
-    "ENABLE_STREAMLIT_SPCS_RUNTIME_V2": True,
-})
-def test_streamlit_spcs_v2():
-    hybrid_executor.execute_query(
-        f"SELECT SYSTEM$STREAMLIT_BOOTSTRAP('{streamlit.name}', 'session-uuid', false)"
-    )
+# Runtime options
+WAREHOUSE_RUNTIME = "SYSTEM$WAREHOUSE_RUNTIME"      # Traditional warehouse-backed
+SPCS_RUNTIME = "SYSTEM$BASIC_RUNTIME"               # SPCS v1
+SPCS_V2_RUNTIME = "SYSTEM$ST_CONTAINER_RUNTIME_PY3_11"  # SPCS v2 (managed)
 ```
 
-### 3.2 Token Authentication Pattern
+### 3.5 Feature Flags Required
 
-**File:** `/Users/mimam/snowflake-research/streamlit-container-runtime/internal/snowflake/config.go`
+| Parameter | Purpose |
+|-----------|---------|
+| `ENABLE_STREAMLIT_SPCS_RUNTIME_V2` | Enable SPCS v2 managed runtime |
+| `ENABLE_STREAMLIT_SPCS_RUNTIME` | Enable SPCS v1 runtime |
+| `ENABLE_SNOWSERVICES_USER_FACING_FEATURES` | Enable SPCS features |
+| `ENABLE_STREAMLIT_PASS_ALTER_PROPERTIES_TO_SPCS_SERVICE` | Allow ALTER STREAMLIT to modify service |
 
-```go
-const TokenFilePath = "/snowflake/session/token"  // OAuth token location
+### 3.6 Service-Streamlit Mapping
 
-// Token refresh logic - valid for 60 minutes
-func getSession() *Session {
-    if session.connection.is_valid() {
-        return session
-    }
-    return createNewSession()
-}
+**File:** `/Users/mimam/snowflake-research/snowflake-main/GlobalServices/src/main/java/com/snowflake/metadata/dictionary/snowservices/StAppSnowservicesManagedObjectProvider.java`
+
+```java
+// SnowserviceSpec is used to manage service specifications
+// Services created with managing_object_name referencing the Streamlit
+// Service origin tracked via SnowserviceOrigin.STREAMLIT
+
+// Query pattern to find service for a Streamlit:
+// SELECT * FROM SHOW SERVICES WHERE managing_object_name = 'db.schema.streamlit_name'
 ```
 
-### 3.3 Key Friction Points
+### 3.7 Key Friction Points for Streamlit Team
 
-1. **Feature Flags**: Multiple flags required (`ENABLE_STREAMLIT_SPCS_RUNTIME_V2`)
-2. **Token Expiration**: 60-minute token requires explicit refresh handling
-3. **Cold Start**: Service startup time affects user experience
-4. **Resource Sharing**: No built-in multi-tenant support
+| Friction | Severity | Details |
+|----------|----------|---------|
+| **Multiple Feature Flags** | High | 4+ flags needed to enable SPCS v2 |
+| **Bootstrap Complexity** | High | Multi-step job creation, timeout handling |
+| **Service Lifecycle** | Medium | Managing service state tied to Streamlit object |
+| **Token Management** | Medium | 60-min OAuth token requires refresh |
+| **Cold Start** | Medium | Service creation adds latency to first load |
 
 ---
 
-## 4. Cortex Services Integration
+## 4. ML Platform Integration (Deep Dive)
 
-### 4.1 Cortex Search Service
+### 4.1 Architecture Overview
+
+ML Platform uses SPCS for **model deployment** (inference services) and **training jobs**.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ML PLATFORM ON SPCS                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  MODEL DEPLOYMENT (Inference)      TRAINING JOBS               │
+│  ─────────────────────────────     ──────────────              │
+│                                                                 │
+│  Model Registry                    Training Script              │
+│       │                                 │                       │
+│       ▼                                 ▼                       │
+│  SYSTEM$DEPLOY_MODEL()             SYSTEM$EXECUTE_ML_JOB()     │
+│       │                                 │                       │
+│       ▼                                 ▼                       │
+│  Build Container Image             Create SPCS Job              │
+│       │                                 │                       │
+│       ▼                                 ▼                       │
+│  Create SPCS Service               Execute in Container         │
+│       │                                 │                       │
+│       ▼                                 ▼                       │
+│  Service Functions:                Output to Stage              │
+│  • PREDICT()                            │                       │
+│  • PREDICT_PROBA()                      ▼                       │
+│  • DECISION_FUNCTION()             Job History Tracking         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Model Deployment
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/ml_platform/t_model_deployment/src/model_deploy.py`
+
+```python
+class ModelDeploy:
+    def verify_deploy_model(self):
+        """Deploy model to SPCS using SYSTEM$DEPLOY_MODEL()"""
+        # Creates inference service with:
+        # - Container image built from model
+        # - Service functions for inference
+        # - Compute pool allocation
+
+    def verify_inference(self):
+        """Run inference queries on deployed models"""
+        # Calls service functions: PREDICT, PREDICT_PROBA, etc.
+
+    def verify_ingress_inference(self):
+        """Handle ingress-based model serving (HTTP endpoints)"""
+```
+
+### 4.3 Deployment Specification
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/ml_platform/t_model_deployment/data/spec/deploy.yml.tmpl`
+
+```yaml
+models:
+  - name: "{{ model_name }}"
+    version: "{{ model_version }}"
+
+image_build:
+  compute_pool: "{{ compute_pool }}"
+  image_repo: "{{ image_repo }}:443/test"
+  force_rebuild: true
+
+service:
+  name: "{{ service_name }}"
+  compute_pool: "{{ compute_pool }}"
+  ingress_enabled: false
+  max_instances: 1
+  cpu: "1"
+  num_workers: 1
+  max_batch_rows: {{ max_batch_rows }}
+  autocapture: {{ autocapture }}  # OTLP metrics
+```
+
+### 4.4 Inference Function Pattern
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/ml_platform/t_model_deployment/data/model/functions/predict.py`
+
+```python
+@vectorized(input=pd.DataFrame, max_batch_size=MAX_BATCH_SIZE)
+def infer(df: pd.DataFrame) -> dict:
+    """Vectorized inference function for batch predictions"""
+    df.columns = input_cols
+    input_df = df.astype(dtype=dtype_map)
+    predictions_df = runner(input_df[input_cols])
+    return predictions_df.to_dict("records")
+```
+
+### 4.5 ML Training Jobs
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/t_mljob/test_execute_ml_job.py`
+
+```python
+@CreateAccount.with_args(parameters={
+    "enable_snowservices": True,
+    "enable_snowservices_user_facing_features": True,
+    "enable_execute_ml_job_function": True,
+})
+class TestExecuteMLJob:
+    def test_execute_ml_job(self, hybrid_executor):
+        spec_options = {
+            "STAGE_PATH": "@payload_stage",
+            "ARGS": [f"@payload_stage/app/{test_py_file}"],
+            "ENTRYPOINT": ["/usr/local/bin/_entrypoint.sh"],
+            "RUNTIME": "ml_runtime_version",
+            "ENV_VARS": {"KEY": "value"},
+            "SPEC_OVERRIDES": {},  # Custom container specs
+            "ENABLE_METRICS": True,
+        }
+
+        job_options = {
+            "QUERY_WAREHOUSE": "compute_wh",
+            "EXTERNAL_ACCESS_INTEGRATIONS": [],
+            "TARGET_INSTANCES": 1,
+            "MIN_INSTANCES": 1,
+            "ASYNC": False,
+        }
+
+        hybrid_executor.execute_query(
+            "CALL SYSTEM$EXECUTE_ML_JOB(%s, %s, %s, %s)",
+            bind_values=["", "CPU_POOL", json.dumps(spec_options), json.dumps(job_options)]
+        )
+```
+
+### 4.6 Batch Inference
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/ml_platform/t_model_deployment/src/batch_inference.py`
+
+```python
+class BatchInference:
+    # Configuration
+    INPUT_STAGE_NAME = "input_stage"
+    OUTPUT_STAGE_NAME = "output_stage"
+    MAX_BATCH_ROWS = 1024
+    COMPLETION_FILENAME = "_SUCCESS"
+
+    # Features:
+    # - Input/output stage management
+    # - Batch row configuration
+    # - Job status monitoring
+    # - Completion markers
+```
+
+### 4.7 Model Serving Observability (OTLP)
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/ml_platform/t_model_deployment/test_inference_otlp_enabled.py`
+
+```python
+# Autocapture metrics automatically recorded:
+record_attributes = {
+    "snow.model_serving.function.name": "predict",
+    "snow.model_serving.request.timestamp": "...",
+    "snow.model_serving.response.timestamp": "...",
+    "snow.model_serving.response.code": 200,
+    # Input features
+    "snow.model_serving.request.data.input_feature_0": "...",
+    "snow.model_serving.request.data.input_feature_1": "...",
+    # Output features
+    "snow.model_serving.response.data.output_feature_0": "...",
+}
+```
+
+### 4.8 ML Platform System Functions
+
+| Function | Purpose |
+|----------|---------|
+| `SYSTEM$DEPLOY_MODEL()` | Deploy model as inference service |
+| `SYSTEM$EXECUTE_ML_JOB()` | Execute training job on SPCS |
+| `SYSTEM$INFERENCE_SERVICES_FOR_MODEL()` | List services for a model |
+| `SYSTEM$GET_DEPLOY_MODEL_RESOURCE_ESTIMATE()` | Estimate compute resources |
+| `SYSTEM$ML_PLATFORM_CAPABILITIES()` | Get platform capabilities |
+
+### 4.9 ML Platform Capabilities
+
+```json
+{
+  "ENABLE_INLINE_DEPLOYMENT_SPEC_FROM_CLIENT_VERSION": "1.8.6",
+  "FEATURE_MODEL_INFERENCE_AUTOCAPTURE": "ENABLED",
+  "IMAGE_BUILD_DEFAULT_IMAGE_REPO": "snowflake.default_image_store.ml_repo",
+  "SPCS_MODEL_ENABLE_JOB_INFERENCE": "true",
+  "SPCS_MODEL_ENABLE_INFERENCE_PROXY_CONTAINER": "true"
+}
+```
+
+### 4.10 Key Friction Points for ML Team
+
+| Friction | Severity | Details |
+|----------|----------|---------|
+| **Image Build Time** | High | PyTorch/TensorFlow take 3-5+ minutes |
+| **Deploy Spec Complexity** | High | YAML with models, image_build, service configs |
+| **Resource Estimation** | Medium | Guessing CPU/memory/GPU needs |
+| **Batch Configuration** | Medium | max_batch_rows, workers tuning |
+| **Multiple System Functions** | Medium | Different functions for deploy vs train |
+
+---
+
+## 5. Native Apps (NASPCS) Integration
+
+### 5.1 Architecture
+
+Native Apps can include SPCS services that run in consumer accounts.
+
+**File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/tests/native_apps/snowservices/`
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NATIVE APPS + SPCS                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Provider Account              Consumer Account                 │
+│  ─────────────────             ────────────────                │
+│                                                                 │
+│  Native App Package            Installed App                    │
+│       │                             │                           │
+│       ├── setup.sql                 ├── CREATE SERVICE          │
+│       ├── service_spec.yaml         ├── Compute Pool (consumer) │
+│       └── container images          └── Running Service         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Key Test Files
+
+- `test_naspcs_restrictions.py` - Security restrictions for app services
+- `test_naspcs_nested_service.py` - Nested service patterns
+- `test_naspcs_query_warehouse_reference_service.py` - Warehouse integration
+- `test_naspcs_eai_reference_service.py` - External access
+- `test_naspcs_image_version_pinning.py` - Image version control
+- `test_naspcs_bg_suspend_resume.py` - Background service lifecycle
+
+---
+
+## 6. Cortex Search Integration
+
+### 6.1 Simplified Pattern (Model to Follow)
 
 **File:** `/Users/mimam/snowflake-research/snowflake-main/Snowfort/snowfort/testlib/native_apps/api/cortex_search_service_api.py`
 
@@ -130,49 +470,12 @@ def create(self, name, schema, search_column, warehouse, source_query, target_la
     return self._execute_sql(sql)
 ```
 
-### 4.2 Cortex Agent Orchestration
-
-**File:** `/Users/mimam/snowflake-research/snowflake-main/GlobalServices/modules/cortex/cortex-protos/src/main/protobuf/cortex_chat_service.proto`
-
-```protobuf
-service Orchestrator {
-  rpc Chat (ChatRequest) returns (stream ChatResponse)
-  rpc Agent (AgentRequest) returns (stream AgentResponse)
-  rpc QuerySemanticModel(SemanticModelQueryRequest) returns (stream SemanticModelQueryResponse)
-}
-
-message AgentRequest {
-  string model = 1;
-  string messages = 4;
-  string tools = 5;
-  map<string, SearchService> search_services = 8;
-  AnalystParams analyst_params = 12;
-}
-```
-
----
-
-## 5. Snowflake Intelligence Agent Integration
-
-### 5.1 Entity Mapping Architecture
-
-**File:** `/Users/mimam/snowflake-research/snowflake-main/GlobalServices/src/main/java/com/snowflake/metadata/dictionary/snowflakeintelligence/SnowflakeIntelligenceEntityMapping.java`
-
-```java
-public class SnowflakeIntelligenceEntityMapping {
-    public static SnowflakeIntelligenceEntityMapping create(
-        SnowflakeIntelligence si, CortexAgent agent) {
-        return new SnowflakeIntelligenceEntityMapping(
-            si.getAccountId(), si.getId(), Domain.CORTEX_AGENT, agent.getId());
-    }
-
-    public static void attachAgentToSnowflakeIntelligenceInTransaction(
-        DPOTransaction tx, SnowflakeIntelligence si, CortexAgent agent) {
-        SnowflakeIntelligenceEntityMapping mapping = create(si, agent);
-        mapping.persist(tx);
-    }
-}
-```
+**Why This Works:**
+- Single SQL statement
+- No compute pool management
+- No container images
+- No ServiceSpec
+- Platform handles everything
 
 ---
 
@@ -673,8 +976,11 @@ def call_external_api():
 | File | Purpose |
 |------|---------|
 | `Snowfort/snowfort/testlib/snowservices/service_spec.py` | ServiceSpec class definition |
-| `Snowfort/tests/snowservices/lib/compute_pool.py` | Compute pool management |
+| `Snowfort/snowfort/testlib/snowservices/service_api.py` | Service API operations |
+| `Snowfort/snowfort/testlib/snowservices/compute_pool_api.py` | Compute pool management |
+| `Snowfort/tests/snowservices/lib/compute_pool.py` | Compute pool utilities |
 | `GlobalServices/modules/snowapi/snowapi-codegen/.../compute-pool.yaml` | REST API spec |
+| `GlobalServices/src/main/java/com/snowflake/sql/execution/ExecCreateService.java` | Service creation |
 
 ### 14.2 Notebooks vNext
 
@@ -682,28 +988,107 @@ def call_external_api():
 |------|---------|
 | `Snowfort/tests/notebooks_vnext/api/notebook_service_api.py` | Service creation API |
 | `Snowfort/tests/notebooks_vnext/test_notebook_managed_service.py` | Integration tests |
+| `GlobalServices/modules/notebooks-vnext/notebooks-vnext-impl/` | Implementation |
+| `Snowfort/tests/t_notebooks/test_notebook_spcs_execute.py` | SPCS execution tests |
+| `Snowfort/tests/t_notebooks/test_notebook_spcs_interactive.py` | Interactive mode |
 
-### 14.3 Streamlit/SiS
+### 14.3 Streamlit/SiS vNext
 
 | File | Purpose |
 |------|---------|
-| `streamlit-container-runtime/internal/snowflake/config.go` | Token auth |
-| `streamlit-container-runtime/runtime-container/scripts/streamlit-runner.py` | Session management |
+| `GlobalServices/src/main/java/com/snowflake/app/stplatform/SpcsInstanceHelpers.java` | Service management |
+| `GlobalServices/src/main/java/com/snowflake/app/streamlit/bootstrap/StreamlitBootstrapHandler.java` | Bootstrap handler |
+| `GlobalServices/src/main/java/com/snowflake/sql/compiler/semantic/functions/StreamlitFuncs.java` | System functions |
 | `Snowfort/tests/t_streamlit/test_streamlit_on_spcs_v2.py` | SPCS v2 tests |
+| `Snowfort/tests/t_streamlit/test_streamlit_bootstrap_spcs.py` | Bootstrap tests |
+| `streamlit-container-runtime/internal/snowflake/config.go` | Token auth |
 
-### 14.4 Cortex Services
+### 14.4 ML Platform
+
+| File | Purpose |
+|------|---------|
+| `Snowfort/tests/ml_platform/t_model_deployment/src/model_deploy.py` | Model deployment |
+| `Snowfort/tests/ml_platform/t_model_deployment/data/spec/deploy.yml.tmpl` | Deploy spec |
+| `Snowfort/tests/ml_platform/t_model_deployment/src/batch_inference.py` | Batch inference |
+| `Snowfort/tests/t_mljob/test_execute_ml_job.py` | Training jobs |
+| `GlobalServices/src/main/java/com/snowflake/sql/compiler/semantic/functions/mlruntime/ExecuteMlJob.java` | Job execution |
+| `GlobalServices/src/main/java/com/snowflake/sql/compiler/semantic/functions/model/DeployModel.java` | Model deploy |
+
+### 14.5 Cortex Services
 
 | File | Purpose |
 |------|---------|
 | `GlobalServices/modules/cortex/cortex-protos/.../cortex_chat_service.proto` | Orchestrator |
 | `Snowfort/snowfort/testlib/native_apps/api/cortex_search_service_api.py` | Search API |
+| `Snowfort/tests/t_cortex_search/test_cortex_search_stage_to_service.py` | Service tests |
+| `GlobalServices/src/main/java/com/snowflake/cortex/rest/inference/` | Inference API |
 
-### 14.5 Intelligence Agent
+### 14.6 Intelligence Agent
 
 | File | Purpose |
 |------|---------|
 | `GlobalServices/.../ExecCreateSnowflakeIntelligence.java` | SI creation |
 | `GlobalServices/.../SnowflakeIntelligenceEntityMapping.java` | SI-Agent mapping |
+| `GlobalServices/.../CortexAgent.java` | Agent implementation |
+
+### 14.7 Native Apps (NASPCS)
+
+| File | Purpose |
+|------|---------|
+| `Snowfort/tests/native_apps/snowservices/test_naspcs_restrictions.py` | Security restrictions |
+| `Snowfort/tests/native_apps/snowservices/test_naspcs_nested_service.py` | Nested services |
+| `Tests/system_tests/native_app_v2_tests/tests/lib/snowservices/services.py` | Service utilities |
+
+---
+
+## 15. Complete Friction Analysis by Product
+
+### 15.1 Friction Matrix
+
+| Product | ServiceSpec | Compute Pool | Image Mgmt | Token Refresh | Resource Est. | Cold Start |
+|---------|-------------|--------------|------------|---------------|---------------|------------|
+| Notebooks vNext | HIGH | HIGH | HIGH | HIGH | MEDIUM | MEDIUM |
+| Streamlit vNext | MEDIUM* | MEDIUM* | LOW* | HIGH | LOW | MEDIUM |
+| ML Model Serving | HIGH | HIGH | HIGH | LOW | HIGH | LOW |
+| ML Training Jobs | MEDIUM | HIGH | MEDIUM | LOW | HIGH | LOW |
+| Cortex Search | LOW | LOW | LOW | LOW | LOW | LOW |
+| Cortex Agent | MEDIUM | LOW | LOW | LOW | LOW | LOW |
+| Intelligence Agent | LOW | LOW | LOW | LOW | LOW | LOW |
+| Native Apps | HIGH | HIGH | HIGH | LOW | MEDIUM | MEDIUM |
+
+*Streamlit vNext uses managed services, reducing some friction
+
+### 15.2 Common Pain Points Across All Products
+
+| Pain Point | Products Affected | Severity |
+|------------|-------------------|----------|
+| **ServiceSpec YAML** | Notebooks, ML, Native Apps | HIGH |
+| **Compute Pool DDL** | All except Cortex Search | HIGH |
+| **Image Build Time** | ML (3-5 min), Notebooks (2-3 min) | HIGH |
+| **Feature Flags** | Streamlit (4+), Notebooks (3+) | MEDIUM |
+| **Token 60-min Expiry** | Notebooks, Streamlit | MEDIUM |
+| **Resource Guessing** | All | MEDIUM |
+
+---
+
+## 16. Summary: All SPCS System Functions
+
+| Function | Product | Purpose |
+|----------|---------|---------|
+| `SYSTEM$NOTEBOOKS_VNEXT_CREATE_INTERACTIVE` | Notebooks | Create interactive notebook service |
+| `SYSTEM$NOTEBOOKS_VNEXT_CREATE_NON_INTERACTIVE` | Notebooks | Create batch notebook service |
+| `SYSTEM$STREAMLIT_BOOTSTRAP` | Streamlit | Bootstrap Streamlit with service |
+| `SYSTEM$STREAMLIT_BOOTSTRAP_STARTUP_STATUS` | Streamlit | Check startup status |
+| `SYSTEM$GET_STREAMLIT_API_TOKEN` | Streamlit | Get API token |
+| `SYSTEM$DEPLOY_MODEL` | ML | Deploy model as service |
+| `SYSTEM$EXECUTE_ML_JOB` | ML | Execute training job |
+| `SYSTEM$INFERENCE_SERVICES_FOR_MODEL` | ML | List inference services |
+| `SYSTEM$GET_DEPLOY_MODEL_RESOURCE_ESTIMATE` | ML | Estimate resources |
+| `SYSTEM$ML_PLATFORM_CAPABILITIES` | ML | Get platform capabilities |
+| `SYSTEM$CREATE_SERVICE` | Core | Create any SPCS service |
+| `SYSTEM$GET_SERVICE_STATUS` | Core | Get service status |
+| `SYSTEM$GET_SERVICE_LOGS` | Core | Get container logs |
+| `SYSTEM$WAIT_FOR_SERVICES` | Core | Wait for service ready |
 
 ---
 
