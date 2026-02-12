@@ -1,0 +1,12 @@
+# Cloned repos (don't track)
+snowflake-main/
+streamlit-container-runtime/
+cortex-code-skills/
+
+# OS files
+.DS_Store
+
+# Editor files
+*.swp
+*.swo
+*~
