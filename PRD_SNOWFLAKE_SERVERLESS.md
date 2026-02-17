@@ -1010,7 +1010,342 @@ endpoint.alert(
 
 ---
 
-## 13. Appendix
+## 13. OpenFlow Integration
+
+### 13.1 Overview
+
+OpenFlow is Snowflake's workflow orchestration framework for coordinating multi-step data pipelines and ML workflows. The serverless platform must integrate seamlessly with OpenFlow to enable declarative workflow definitions without infrastructure complexity.
+
+### 13.2 Current OpenFlow + SPCS Pattern
+
+**Today's approach (complex):**
+```yaml
+# OpenFlow workflow definition
+tasks:
+  - id: preprocess_data
+    type: spcs_job
+    config:
+      compute_pool: MY_POOL           # Must pre-create
+      image: data-prep:v1             # Must build/push
+      command: ["python", "prep.py"]
+      # ... 10+ more config lines
+```
+
+**Developer must manage:**
+- Compute pool creation and sizing
+- Container image building and versioning
+- ServiceSpec configuration
+- Resource estimation
+
+### 13.3 Proposed Serverless + OpenFlow Integration
+
+**New approach (simple):**
+```python
+import snowflake.serverless as sf
+
+# Define function with decorator
+@sf.function(tier="medium")
+def preprocess_data(batch):
+    return transform(batch)
+
+# OpenFlow workflow references function
+workflow = sf.workflow("ml_pipeline")
+workflow.add_task("preprocess", preprocess_data)
+workflow.add_task("train", train_model, depends_on=["preprocess"])
+workflow.deploy()
+```
+
+**Platform handles:**
+- Automatic function deployment
+- Resource allocation
+- Image building
+- State management
+
+### 13.4 Integration Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              OPENFLOW + SERVERLESS INTEGRATION                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Developer Code                                                 │
+│       │                                                         │
+│       ├─▶ @sf.function() decorators                            │
+│       └─▶ workflow.add_task()                                  │
+│                                                                 │
+│                        │                                        │
+│                        ▼                                        │
+│                                                                 │
+│  Serverless Platform                                           │
+│       │                                                         │
+│       ├─▶ sf.deploy() → creates endpoints                      │
+│       └─▶ Returns function IDs                                 │
+│                                                                 │
+│                        │                                        │
+│                        ▼                                        │
+│                                                                 │
+│  OpenFlow Orchestrator                                         │
+│       │                                                         │
+│       ├─▶ Schedules task execution                             │
+│       ├─▶ Manages dependencies                                 │
+│       ├─▶ Handles retries/failures                             │
+│       └─▶ Tracks state                                         │
+│                                                                 │
+│                        │                                        │
+│                        ▼                                        │
+│                                                                 │
+│  SPCS Backend (invisible)                                      │
+│       │                                                         │
+│       ├─▶ Compute pools                                        │
+│       ├─▶ Container execution                                  │
+│       └─▶ Resource management                                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 13.5 API Design for Workflows
+
+```python
+import snowflake.serverless as sf
+
+# Define workflow tasks as functions
+@sf.function(tier="medium")
+def extract_features(input_path: str) -> str:
+    """Extract features from raw data."""
+    # Process data
+    return output_path
+
+@sf.function(tier="gpu-large")
+def train_model(features_path: str) -> str:
+    """Train ML model on features."""
+    # Train model
+    return model_path
+
+@sf.function(tier="medium")
+def evaluate_model(model_path: str) -> dict:
+    """Evaluate model performance."""
+    # Run evaluation
+    return metrics
+
+# Create workflow
+workflow = sf.Workflow("ml_training_pipeline")
+
+# Add tasks with dependencies
+workflow.add_task(
+    "extract",
+    extract_features,
+    args={"input_path": "@raw_data/inputs"}
+)
+
+workflow.add_task(
+    "train",
+    train_model,
+    depends_on=["extract"],
+    retry_policy={"max_attempts": 3, "backoff_seconds": [60, 300, 900]}
+)
+
+workflow.add_task(
+    "evaluate",
+    evaluate_model,
+    depends_on=["train"]
+)
+
+# Deploy workflow (creates all functions + orchestration)
+workflow.deploy()
+
+# Trigger workflow execution
+run = workflow.run()
+print(f"Workflow run ID: {run.id}")
+
+# Monitor progress
+status = run.status()  # RUNNING, SUCCEEDED, FAILED
+logs = run.logs()
+```
+
+### 13.6 Advanced Workflow Patterns
+
+#### Pattern 1: Parallel Fan-Out
+```python
+@sf.function(tier="medium")
+def process_partition(partition_id: int):
+    return process(partition_id)
+
+workflow = sf.Workflow("parallel_processing")
+
+# Process 100 partitions in parallel
+for i in range(100):
+    workflow.add_task(f"partition_{i}", process_partition, args={"partition_id": i})
+
+# Merge results
+workflow.add_task("merge", merge_results, depends_on=[f"partition_{i}" for i in range(100)])
+```
+
+#### Pattern 2: Conditional Branching
+```python
+workflow = sf.Workflow("conditional_pipeline")
+
+workflow.add_task("check_quality", check_data_quality)
+
+# Only run cleaning if quality is poor
+workflow.add_task(
+    "clean_data",
+    clean_data,
+    depends_on=["check_quality"],
+    condition="check_quality.result.score < 0.95"
+)
+
+# Training runs either way
+workflow.add_task(
+    "train",
+    train_model,
+    depends_on=["check_quality", "clean_data"],
+    condition="check_quality.result.score >= 0.95 OR clean_data.status == 'SUCCEEDED'"
+)
+```
+
+#### Pattern 3: Scheduled Workflows
+```python
+workflow = sf.Workflow("nightly_pipeline")
+
+# Schedule: daily at midnight
+workflow.schedule("0 0 * * *")
+
+workflow.add_task("extract", extract_data)
+workflow.add_task("transform", transform_data, depends_on=["extract"])
+workflow.add_task("load", load_data, depends_on=["transform"])
+
+workflow.deploy()
+```
+
+### 13.7 Data Passing Between Tasks
+
+```python
+# Pattern 1: Return values (automatic stage storage)
+@sf.function(tier="medium")
+def task_a():
+    return {"status": "success", "count": 1000}  # Auto-stored in stage
+
+@sf.function(tier="medium")
+def task_b(input_data: dict):
+    print(input_data["count"])  # Receives output from task_a
+
+workflow.add_task("a", task_a)
+workflow.add_task("b", task_b, inputs={"input_data": "a.result"})  # Reference previous task
+
+# Pattern 2: Explicit stage paths
+@sf.function(tier="medium")
+def task_c():
+    df.to_parquet("@pipeline_stage/output.parquet")
+    return "@pipeline_stage/output.parquet"
+
+@sf.function(tier="medium")
+def task_d(input_path: str):
+    df = pd.read_parquet(input_path)
+```
+
+### 13.8 Monitoring and Observability
+
+```python
+# Get workflow status
+run = workflow.get_run(run_id)
+
+# Task-level metrics
+for task in run.tasks:
+    print(f"{task.name}: {task.status}")
+    print(f"  Duration: {task.duration_seconds}s")
+    print(f"  Cost: ${task.cost}")
+    print(f"  Logs: {task.logs()}")
+
+# Workflow-level metrics
+print(f"Total duration: {run.duration_seconds}s")
+print(f"Total cost: ${run.cost}")
+print(f"Task success rate: {run.success_rate}%")
+
+# Set up alerts
+workflow.alert(
+    name="failure_alert",
+    condition="status == 'FAILED'",
+    notify=["slack://data-team", "email://oncall@company.com"]
+)
+```
+
+### 13.9 Integration with Existing OpenFlow Workflows
+
+**Migration path for existing OpenFlow workflows:**
+
+1. **Phase 1: Hybrid Mode** (backward compatible)
+```yaml
+# Existing SPCS tasks continue to work
+tasks:
+  - id: legacy_task
+    type: spcs_job
+    config:
+      compute_pool: MY_POOL
+      image: legacy:v1
+
+  # New serverless tasks coexist
+  - id: new_task
+    type: serverless_function
+    function_ref: "my_function"  # References sf.function()
+```
+
+2. **Phase 2: Full Migration**
+```python
+# Convert entire workflow to serverless
+workflow = sf.Workflow.from_yaml("legacy_workflow.yaml")
+workflow.convert_to_serverless()  # Automatic migration
+workflow.deploy()
+```
+
+### 13.10 Benefits of Serverless + OpenFlow
+
+| Capability | Current (OpenFlow + SPCS) | With Serverless | Improvement |
+|------------|--------------------------|-----------------|-------------|
+| **Task Definition** | 20+ lines YAML | 5 lines Python | 75% reduction |
+| **Compute Management** | Manual pool creation | Automatic | Zero overhead |
+| **Image Management** | Manual build/push | Automatic | Zero overhead |
+| **Cold Start** | 1-5 minutes | < 30 seconds | 80%+ faster |
+| **Resource Tuning** | Manual trial-and-error | Auto-optimization | Intelligent |
+| **Cost Tracking** | Job-level only | Function + workflow level | Granular |
+| **Developer Friction** | High | Low | Smooth |
+
+### 13.11 Requirements for Integration
+
+#### FR13: OpenFlow Integration
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| FR13.1 | Support `sf.Workflow()` API for workflow definition | P0 |
+| FR13.2 | Automatic function deployment when workflow is deployed | P0 |
+| FR13.3 | Task dependency management (depends_on) | P0 |
+| FR13.4 | Pass data between tasks via return values | P0 |
+| FR13.5 | Workflow scheduling (cron expressions) | P1 |
+| FR13.6 | Conditional task execution | P1 |
+| FR13.7 | Retry policies per task | P1 |
+| FR13.8 | Workflow-level monitoring and alerts | P1 |
+| FR13.9 | Parallel task execution (fan-out/fan-in) | P1 |
+| FR13.10 | Migration tool from YAML workflows to serverless | P2 |
+| FR13.11 | Hybrid mode (mix SPCS + serverless tasks) | P2 |
+
+### 13.12 Implementation Notes
+
+**Backend Integration Points:**
+
+1. **Function Registry**: Serverless functions register with OpenFlow's task registry
+2. **State Management**: OpenFlow tracks serverless function execution state
+3. **Resource Allocation**: Serverless platform communicates available capacity to OpenFlow
+4. **Failure Handling**: OpenFlow's retry logic works transparently with serverless functions
+5. **Data Lineage**: Track data flow through workflow stages automatically
+
+**Technical Considerations:**
+
+- Serverless functions must support long-running tasks (hours) for ML training
+- Checkpointing for resumable execution after failures
+- Output caching to avoid re-running expensive tasks
+- Cross-workflow function sharing (same function used in multiple workflows)
+
+---
+
+## 14. Appendix
 
 ### A. Current vs Proposed Comparison
 
@@ -1063,8 +1398,11 @@ endpoint = sf.deploy(my_function)
 | Compute Pool | Group of compute nodes for running containers |
 | Warm Pool | Pre-provisioned pool for fast cold starts |
 | Tier | Predefined resource configuration (small/medium/large) |
+| OpenFlow | Snowflake's workflow orchestration framework for multi-step pipelines |
+| DAG | Directed Acyclic Graph - workflow structure with task dependencies |
 
 ---
 
-*Document Version: 1.0*
+*Document Version: 1.1*
 *Created: February 2026*
+*Updated: February 2026 - Added OpenFlow integration section*
