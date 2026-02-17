@@ -479,7 +479,380 @@ def create(self, name, schema, search_column, warehouse, source_query, target_la
 
 ---
 
-## 6. ServiceSpec Deep Dive
+## 6. OpenFlow & SPCS Integration (Deep Dive)
+
+### 6.1 What is OpenFlow?
+
+OpenFlow is Snowflake's **orchestration framework for serverless workflows** - designed to coordinate distributed compute tasks across Snowflake services. It provides a declarative way to define multi-step data pipelines and ML workflows that span multiple execution engines.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        OPENFLOW ARCHITECTURE                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  User defines workflow (DAG)                                    │
+│       │                                                         │
+│       ▼                                                         │
+│  OpenFlow Orchestrator                                         │
+│       │                                                         │
+│       ├─▶ Task 1: Warehouse Query                             │
+│       ├─▶ Task 2: SPCS Container Job                          │
+│       ├─▶ Task 3: Python UDF                                  │
+│       ├─▶ Task 4: External API Call                           │
+│       └─▶ Task 5: SPCS Model Inference                        │
+│                                                                 │
+│  Handles: Scheduling, Dependencies, Retries, State             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 OpenFlow's Role in the Serverless Ecosystem
+
+| Component | Role | Relationship to SPCS |
+|-----------|------|---------------------|
+| **OpenFlow** | Workflow orchestration | Schedules and coordinates SPCS jobs |
+| **SPCS** | Container execution runtime | Executes OpenFlow tasks in containers |
+| **Warehouses** | SQL query processing | Alternative execution for SQL-heavy tasks |
+| **Cortex** | AI/ML inference | Can be orchestrated by OpenFlow via SPCS |
+
+### 6.3 How OpenFlow Interacts with SPCS
+
+OpenFlow uses SPCS as an **execution backend** for containerized tasks. The integration pattern:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              OPENFLOW → SPCS INTEGRATION FLOW                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. OpenFlow Workflow Definition                               │
+│     workflow:                                                   │
+│       - task_id: "preprocess_data"                             │
+│         type: "spcs_job"                                        │
+│         compute_pool: "ML_POOL"                                │
+│         container_image: "data-prep:v1"                        │
+│                                                                 │
+│  2. OpenFlow Scheduler triggers task                           │
+│       │                                                         │
+│       ▼                                                         │
+│  3. Calls SYSTEM$CREATE_JOB (SPCS Job API)                     │
+│       │                                                         │
+│       ├── Compute Pool: ML_POOL                                │
+│       ├── Image: data-prep:v1                                  │
+│       ├── Command: python preprocess.py --input @stage/data    │
+│       └── Environment: {TASK_ID: "task_123", ...}              │
+│                                                                 │
+│  4. SPCS creates job in container                              │
+│       │                                                         │
+│       ▼                                                         │
+│  5. OpenFlow monitors job status                               │
+│       │                                                         │
+│       ├── RUNNING → continues                                  │
+│       ├── SUCCEEDED → trigger next task                        │
+│       └── FAILED → retry or fail workflow                      │
+│                                                                 │
+│  6. Job completes, writes output to stage                      │
+│       │                                                         │
+│       ▼                                                         │
+│  7. OpenFlow reads output, proceeds to next task               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.4 OpenFlow Task Types for SPCS
+
+| Task Type | SPCS Component | Use Case |
+|-----------|---------------|----------|
+| **`spcs_job`** | SPCS Jobs (batch) | One-time containerized tasks |
+| **`spcs_service`** | SPCS Services | Long-running API servers |
+| **`spcs_inference`** | Model Serving | ML model predictions |
+| **`spcs_training`** | ML Training Jobs | Model training workloads |
+
+### 6.5 Example: ML Pipeline with OpenFlow + SPCS
+
+```yaml
+# OpenFlow workflow definition
+name: ml_training_pipeline
+version: 1.0
+
+tasks:
+  # Step 1: Feature engineering (SPCS Job)
+  - id: feature_engineering
+    type: spcs_job
+    config:
+      compute_pool: CPU_POOL
+      image: feature-eng:v2
+      command: ["python", "features.py"]
+      input_stage: "@raw_data/inputs"
+      output_stage: "@processed/features"
+      env:
+        BATCH_SIZE: "10000"
+
+  # Step 2: Model training (SPCS Training Job)
+  - id: train_model
+    type: spcs_training
+    depends_on: [feature_engineering]
+    config:
+      compute_pool: GPU_POOL
+      image: pytorch-trainer:v1
+      gpu: "A10G"
+      command: ["python", "train.py"]
+      input_stage: "@processed/features"
+      output_stage: "@models/checkpoints"
+      hyperparameters:
+        learning_rate: 0.001
+        epochs: 100
+
+  # Step 3: Model evaluation (SPCS Job)
+  - id: evaluate
+    type: spcs_job
+    depends_on: [train_model]
+    config:
+      compute_pool: CPU_POOL
+      image: model-eval:v1
+      command: ["python", "evaluate.py"]
+      input_stage: "@models/checkpoints"
+      output_stage: "@metrics/results"
+
+  # Step 4: Deploy model (SPCS Service)
+  - id: deploy_model
+    type: spcs_service
+    depends_on: [evaluate]
+    condition: "metrics.accuracy > 0.95"
+    config:
+      compute_pool: GPU_INFERENCE_POOL
+      image: model-server:v1
+      service_name: "prod_model_v2"
+      endpoint_public: true
+      min_instances: 2
+      max_instances: 10
+```
+
+### 6.6 OpenFlow-SPCS State Management
+
+OpenFlow needs to track the state of SPCS jobs across the workflow:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 OPENFLOW STATE TRACKING                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  OpenFlow Metadata Store (FDB)                                 │
+│       │                                                         │
+│       ├── Workflow Instance: wf_12345                          │
+│       │       ├── Status: RUNNING                              │
+│       │       ├── Started: 2026-02-17T10:00:00Z               │
+│       │       └── Tasks:                                       │
+│       │               ├── feature_engineering                  │
+│       │               │     ├── SPCS Job ID: job_abc123       │
+│       │               │     ├── Status: SUCCEEDED             │
+│       │               │     └── Output: @processed/features   │
+│       │               ├── train_model                          │
+│       │               │     ├── SPCS Job ID: job_def456       │
+│       │               │     ├── Status: RUNNING               │
+│       │               │     └── Progress: 45%                 │
+│       │               └── evaluate                             │
+│       │                     └── Status: PENDING               │
+│                                                                 │
+│  Integration Points:                                            │
+│  • SHOW SERVICES/JOBS in SPCS → poll for status               │
+│  • SYSTEM$GET_JOB_STATUS(job_id) → detailed state             │
+│  • SYSTEM$CANCEL_JOB(job_id) → failure handling               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.7 Key SPCS APIs Used by OpenFlow
+
+| API / System Function | Purpose | OpenFlow Usage |
+|----------------------|---------|----------------|
+| `SYSTEM$CREATE_JOB()` | Create batch job | Submit containerized tasks |
+| `SYSTEM$GET_JOB_STATUS()` | Check job state | Poll for completion |
+| `SYSTEM$GET_JOB_LOGS()` | Retrieve logs | Debugging failed tasks |
+| `SYSTEM$CANCEL_JOB()` | Stop job | Workflow cancellation |
+| `CREATE SERVICE` | Deploy service | Long-running task endpoints |
+| `SHOW JOBS` | List jobs | Monitoring active tasks |
+| `DESCRIBE JOB` | Get job details | Inspect configuration |
+
+### 6.8 Data Flow Between OpenFlow and SPCS
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DATA PASSING PATTERNS                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Pattern 1: Stage-Based (Recommended)                          │
+│  ─────────────────────────────                                 │
+│  Task A (SPCS) → writes to @stage/output                       │
+│                  │                                              │
+│                  ▼                                              │
+│  OpenFlow → reads metadata from @stage/output/_metadata.json   │
+│                  │                                              │
+│                  ▼                                              │
+│  Task B (SPCS) → reads from @stage/output                      │
+│                                                                 │
+│  Pattern 2: Table-Based                                        │
+│  ──────────────────────                                        │
+│  Task A (SPCS) → writes to TABLE intermediate_results          │
+│                  │                                              │
+│                  ▼                                              │
+│  OpenFlow → SELECT status FROM intermediate_results            │
+│                  │                                              │
+│                  ▼                                              │
+│  Task B (SPCS) → SELECT * FROM intermediate_results            │
+│                                                                 │
+│  Pattern 3: Service Endpoint                                   │
+│  ───────────────────────                                       │
+│  Task A (SPCS Service) → exposes /api/status endpoint          │
+│                  │                                              │
+│                  ▼                                              │
+│  OpenFlow → HTTP GET to service endpoint                       │
+│                  │                                              │
+│                  ▼                                              │
+│  Task B (SPCS) → HTTP POST to Task A service                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.9 Retry and Failure Handling
+
+OpenFlow manages SPCS job failures through configurable retry policies:
+
+```yaml
+# OpenFlow task with retry configuration
+- id: flaky_processing
+  type: spcs_job
+  config:
+    compute_pool: CPU_POOL
+    image: processor:v1
+    command: ["python", "process.py"]
+  retry_policy:
+    max_attempts: 3
+    backoff_seconds: [60, 300, 900]  # 1min, 5min, 15min
+    retry_on:
+      - "container_exit_code != 0"
+      - "spcs_job_status == 'FAILED'"
+    fail_fast_on:
+      - "container_exit_code == 42"  # Unrecoverable error
+```
+
+### 6.10 Monitoring and Observability
+
+OpenFlow aggregates observability data from SPCS jobs:
+
+| Metric | Source | OpenFlow Action |
+|--------|--------|----------------|
+| **Container Logs** | `SYSTEM$GET_SERVICE_LOGS()` | Store in workflow metadata |
+| **Resource Usage** | SPCS metrics API | Track for cost attribution |
+| **Task Duration** | Job start/end timestamps | Identify bottlenecks |
+| **Error Messages** | Container stderr | Surface to workflow UI |
+| **Data Lineage** | Stage reads/writes | Build dependency graph |
+
+### 6.11 Scaling Patterns
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              OPENFLOW SCALING WITH SPCS                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Pattern 1: Parallel Fan-Out                                   │
+│  ──────────────────────────                                    │
+│  Input Data: 100 files                                         │
+│       │                                                         │
+│       ├─▶ SPCS Job 1 (files 1-10)                             │
+│       ├─▶ SPCS Job 2 (files 11-20)                            │
+│       ├─▶ ...                                                  │
+│       └─▶ SPCS Job 10 (files 91-100)                          │
+│                  │                                              │
+│                  ▼                                              │
+│       Merge Task → Combine results                             │
+│                                                                 │
+│  Pattern 2: Dynamic Scaling                                    │
+│  ────────────────────────                                      │
+│  OpenFlow → Check queue depth                                  │
+│       │                                                         │
+│       ├─▶ If queue > 1000: Launch 10 SPCS jobs                │
+│       ├─▶ If queue < 100: Launch 2 SPCS jobs                  │
+│       └─▶ Scale down when queue empty                          │
+│                                                                 │
+│  Pattern 3: Conditional Execution                              │
+│  ──────────────────────────────                                │
+│  Task A → Check data quality                                   │
+│       │                                                         │
+│       ├─▶ If quality > 95%: Skip cleaning (warehouse query)    │
+│       └─▶ If quality < 95%: Launch SPCS cleaning job           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.12 OpenFlow vs Direct SPCS Usage
+
+| Dimension | OpenFlow + SPCS | Direct SPCS | Winner |
+|-----------|----------------|-------------|--------|
+| **Single Task** | Overhead | Direct | Direct SPCS |
+| **Multi-Step Pipeline** | Orchestration built-in | Manual coordination | OpenFlow |
+| **Retry Logic** | Declarative | Manual | OpenFlow |
+| **Conditional Branching** | DAG support | Complex code | OpenFlow |
+| **Monitoring** | Workflow-level | Job-level | OpenFlow |
+| **Scheduling** | Cron + dependencies | Separate scheduler needed | OpenFlow |
+| **Cost Attribution** | Per-workflow | Per-job | OpenFlow |
+
+### 6.13 Use Cases: When to Use OpenFlow with SPCS
+
+| Use Case | Why OpenFlow + SPCS? |
+|----------|---------------------|
+| **ETL Pipelines** | Multi-stage data transformation with dependencies |
+| **ML Training** | Data prep → train → evaluate → deploy sequence |
+| **Batch Processing** | Daily/hourly jobs with retry logic |
+| **Multi-Tenant Workflows** | Per-customer data processing at scale |
+| **Hybrid Compute** | Mix warehouse queries + containerized tasks |
+| **Long-Running Jobs** | Need checkpointing and failure recovery |
+
+### 6.14 Current Limitations
+
+| Limitation | Impact | Workaround |
+|------------|--------|------------|
+| **No Live Streaming** | Can't handle real-time events | Use SPCS services directly |
+| **Fixed DAG** | Can't dynamically generate tasks | Pre-generate all possible branches |
+| **Limited Task Types** | Only supports predefined types | Use generic `spcs_job` |
+| **State Storage in FDB** | Large state can bloat metadata | Store data in stages, only refs in OpenFlow |
+| **No Cross-Account** | Workflows stay in single account | Manual coordination |
+
+### 6.15 Future Evolution: Serverless Integration
+
+With a Modal.ai-style serverless interface, OpenFlow could simplify:
+
+**Current (OpenFlow + SPCS):**
+```yaml
+- id: process_data
+  type: spcs_job
+  config:
+    compute_pool: MY_POOL
+    image: processor:v1
+    command: ["python", "process.py"]
+    # ... 15 more config lines
+```
+
+**Future (OpenFlow + Serverless SDK):**
+```python
+import snowflake.serverless as sf
+
+@sf.function(tier="medium")
+def process_data(batch):
+    return transform(batch)
+
+# OpenFlow automatically calls sf.deploy() and manages lifecycle
+workflow.add_task("process_data", process_data)
+```
+
+This would eliminate:
+- Compute pool management
+- Container image versioning
+- ServiceSpec complexity
+- Manual resource estimation
+
+---
+
+## 7. ServiceSpec Deep Dive
 
 ### 6.1 Core Class Structure
 
@@ -525,9 +898,9 @@ DEFAULT_RESOURCE_SPEC = ResourceSpec(
 
 ---
 
-## 7. Compute Pool Management
+## 8. Compute Pool Management
 
-### 7.1 Instance Families
+### 8.1 Instance Families
 
 | Instance Family | vCPU | Memory | Storage | GPU | Use Case |
 |-----------------|------|--------|---------|-----|----------|
@@ -541,9 +914,9 @@ DEFAULT_RESOURCE_SPEC = ResourceSpec(
 
 ---
 
-## 8. Friction Points Summary
+## 9. Friction Points Summary
 
-### 8.1 High Severity (Must Solve)
+### 9.1 High Severity (Must Solve)
 
 | Friction | Current State | Impact |
 |----------|--------------|--------|
@@ -551,7 +924,7 @@ DEFAULT_RESOURCE_SPEC = ResourceSpec(
 | **Compute Pool Management** | Manual DDL, sizing | Delays deployment |
 | **Image Management** | Build/push/version | DevOps overhead |
 
-### 8.2 Medium Severity
+### 9.2 Medium Severity
 
 | Friction | Current State | Impact |
 |----------|--------------|--------|
@@ -561,9 +934,9 @@ DEFAULT_RESOURCE_SPEC = ResourceSpec(
 
 ---
 
-## 9. Vision: Modal.ai-Style Serverless Interface
+## 10. Vision: Modal.ai-Style Serverless Interface
 
-### 9.1 What is Modal.ai?
+### 10.1 What is Modal.ai?
 
 Modal.ai provides a developer experience where you:
 1. **Write code in any language** (Python, etc.)
@@ -571,7 +944,7 @@ Modal.ai provides a developer experience where you:
 3. **Deploy instantly** - platform handles everything
 4. **Get endpoints automatically** - no infrastructure config
 
-### 9.2 Proposed Snowflake Serverless Interface
+### 10.2 Proposed Snowflake Serverless Interface
 
 #### Python SDK (Primary Interface)
 
@@ -657,7 +1030,7 @@ def nightly_training():
 job = sf.deploy(nightly_training)
 ```
 
-### 9.3 Multi-Language Support
+### 10.3 Multi-Language Support
 
 #### Python (Native)
 ```python
@@ -688,7 +1061,7 @@ endpoint = sf.from_stage(
 )
 ```
 
-### 9.4 Resource Tiers (Simplified)
+### 10.4 Resource Tiers (Simplified)
 
 Instead of instance families, offer simple tiers:
 
@@ -712,9 +1085,9 @@ def ml_inference(data):
 
 ---
 
-## 10. Architecture: What Platform Handles
+## 11. Architecture: What Platform Handles
 
-### 10.1 Developer Provides
+### 11.1 Developer Provides
 
 | Input | Required | Example |
 |-------|----------|---------|
@@ -723,7 +1096,7 @@ def ml_inference(data):
 | **Secrets** | Optional | `["api_key", "db_password"]` |
 | **Schedule** | Optional | Cron expression for jobs |
 
-### 10.2 Platform Handles (Invisible to Developer)
+### 11.2 Platform Handles (Invisible to Developer)
 
 | Responsibility | How Platform Handles |
 |----------------|---------------------|
@@ -739,7 +1112,7 @@ def ml_inference(data):
 | **Monitoring** | Built-in metrics and logs |
 | **Cost Attribution** | Track per-function/per-user |
 
-### 10.3 Behind the Scenes
+### 11.3 Behind the Scenes
 
 When a developer runs `sf.deploy(my_function)`:
 
@@ -774,9 +1147,9 @@ When a developer runs `sf.deploy(my_function)`:
 
 ---
 
-## 11. API Design
+## 12. API Design
 
-### 11.1 Core Decorators
+### 12.1 Core Decorators
 
 ```python
 # Function endpoint
@@ -792,7 +1165,7 @@ When a developer runs `sf.deploy(my_function)`:
 @sf.service(cpu=2, memory="4GB", min_instances=1, max_instances=10)
 ```
 
-### 11.2 Deployment Methods
+### 12.2 Deployment Methods
 
 ```python
 # Deploy and get endpoint
@@ -808,7 +1181,7 @@ endpoint = sf.from_stage(stage="@code/app", entrypoint="main.py")
 notebook = sf.notebook(source="@notebooks/analysis.ipynb", cpu=4)
 ```
 
-### 11.3 Endpoint Operations
+### 12.3 Endpoint Operations
 
 ```python
 # Get endpoint info
@@ -834,7 +1207,7 @@ endpoint.start()
 endpoint.delete()
 ```
 
-### 11.4 Resource Specification Options
+### 12.4 Resource Specification Options
 
 ```python
 # Option 1: Explicit resources
@@ -849,9 +1222,9 @@ endpoint.delete()
 
 ---
 
-## 12. Comparison: Current vs Proposed
+## 13. Comparison: Current vs Proposed
 
-### 12.1 Current SPCS (50+ lines)
+### 13.1 Current SPCS (50+ lines)
 
 ```python
 # 1. Create compute pool (separate DDL)
@@ -897,7 +1270,7 @@ cursor.execute(f"""
 # SHOW ENDPOINTS IN SERVICE my_service
 ```
 
-### 12.2 Proposed Serverless (5 lines)
+### 13.2 Proposed Serverless (5 lines)
 
 ```python
 import snowflake.serverless as sf
@@ -910,7 +1283,7 @@ endpoint = sf.deploy(my_function)
 # Done. endpoint.url is ready to use.
 ```
 
-### 12.3 Reduction
+### 13.3 Reduction
 
 | Metric | Current | Proposed | Reduction |
 |--------|---------|----------|-----------|
@@ -921,9 +1294,9 @@ endpoint = sf.deploy(my_function)
 
 ---
 
-## 13. Implementation Considerations
+## 14. Implementation Considerations
 
-### 13.1 For Internal Teams (Notebooks, Streamlit, Cortex)
+### 14.1 For Internal Teams (Notebooks, Streamlit, Cortex)
 
 The serverless interface can be adopted incrementally:
 
@@ -931,7 +1304,7 @@ The serverless interface can be adopted incrementally:
 2. **Phase 2**: Existing services migrate to decorators
 3. **Phase 3**: Deprecate direct ServiceSpec usage
 
-### 13.2 Backward Compatibility
+### 14.2 Backward Compatibility
 
 ```python
 # Escape hatch: access underlying ServiceSpec if needed
@@ -949,7 +1322,7 @@ endpoint = sf.deploy(my_function, spec_overrides={
 })
 ```
 
-### 13.3 Snowflake Integration
+### 14.3 Snowflake Integration
 
 ```python
 # Access Snowflake data from within functions
@@ -969,9 +1342,9 @@ def call_external_api():
 
 ---
 
-## 14. Key Files Reference
+## 15. Key Files Reference
 
-### 14.1 Core SPCS Infrastructure
+### 15.1 Core SPCS Infrastructure
 
 | File | Purpose |
 |------|---------|
@@ -982,7 +1355,7 @@ def call_external_api():
 | `GlobalServices/modules/snowapi/snowapi-codegen/.../compute-pool.yaml` | REST API spec |
 | `GlobalServices/src/main/java/com/snowflake/sql/execution/ExecCreateService.java` | Service creation |
 
-### 14.2 Notebooks vNext
+### 15.2 Notebooks vNext
 
 | File | Purpose |
 |------|---------|
@@ -992,7 +1365,7 @@ def call_external_api():
 | `Snowfort/tests/t_notebooks/test_notebook_spcs_execute.py` | SPCS execution tests |
 | `Snowfort/tests/t_notebooks/test_notebook_spcs_interactive.py` | Interactive mode |
 
-### 14.3 Streamlit/SiS vNext
+### 15.3 Streamlit/SiS vNext
 
 | File | Purpose |
 |------|---------|
@@ -1003,7 +1376,7 @@ def call_external_api():
 | `Snowfort/tests/t_streamlit/test_streamlit_bootstrap_spcs.py` | Bootstrap tests |
 | `streamlit-container-runtime/internal/snowflake/config.go` | Token auth |
 
-### 14.4 ML Platform
+### 15.4 ML Platform
 
 | File | Purpose |
 |------|---------|
@@ -1014,7 +1387,7 @@ def call_external_api():
 | `GlobalServices/src/main/java/com/snowflake/sql/compiler/semantic/functions/mlruntime/ExecuteMlJob.java` | Job execution |
 | `GlobalServices/src/main/java/com/snowflake/sql/compiler/semantic/functions/model/DeployModel.java` | Model deploy |
 
-### 14.5 Cortex Services
+### 15.5 Cortex Services
 
 | File | Purpose |
 |------|---------|
@@ -1023,7 +1396,7 @@ def call_external_api():
 | `Snowfort/tests/t_cortex_search/test_cortex_search_stage_to_service.py` | Service tests |
 | `GlobalServices/src/main/java/com/snowflake/cortex/rest/inference/` | Inference API |
 
-### 14.6 Intelligence Agent
+### 15.6 Intelligence Agent
 
 | File | Purpose |
 |------|---------|
@@ -1031,7 +1404,7 @@ def call_external_api():
 | `GlobalServices/.../SnowflakeIntelligenceEntityMapping.java` | SI-Agent mapping |
 | `GlobalServices/.../CortexAgent.java` | Agent implementation |
 
-### 14.7 Native Apps (NASPCS)
+### 15.7 Native Apps (NASPCS)
 
 | File | Purpose |
 |------|---------|
@@ -1041,9 +1414,9 @@ def call_external_api():
 
 ---
 
-## 15. Complete Friction Analysis by Product
+## 16. Complete Friction Analysis by Product
 
-### 15.1 Friction Matrix
+### 16.1 Friction Matrix
 
 | Product | ServiceSpec | Compute Pool | Image Mgmt | Token Refresh | Resource Est. | Cold Start |
 |---------|-------------|--------------|------------|---------------|---------------|------------|
@@ -1058,7 +1431,7 @@ def call_external_api():
 
 *Streamlit vNext uses managed services, reducing some friction
 
-### 15.2 Common Pain Points Across All Products
+### 16.2 Common Pain Points Across All Products
 
 | Pain Point | Products Affected | Severity |
 |------------|-------------------|----------|
@@ -1071,7 +1444,7 @@ def call_external_api():
 
 ---
 
-## 16. Summary: All SPCS System Functions
+## 17. Summary: All SPCS System Functions
 
 | Function | Product | Purpose |
 |----------|---------|---------|
@@ -1092,9 +1465,9 @@ def call_external_api():
 
 ---
 
-## 15. PRD Recommendations
+## 18. PRD Recommendations
 
-### 15.1 Design Principles
+### 18.1 Design Principles
 
 1. **Code-First**: Developers write code, not infrastructure
 2. **Any Language**: Python native, containers for others
@@ -1102,7 +1475,7 @@ def call_external_api():
 4. **Zero Infrastructure**: No pools, specs, images to manage
 5. **Snowflake Native**: Automatic session, data access, secrets
 
-### 15.2 MVP Scope
+### 18.2 MVP Scope
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
@@ -1117,7 +1490,7 @@ def call_external_api():
 | `@sf.service` | P2 | Long-running services |
 | Multi-language | P2 | Beyond Python |
 
-### 15.3 Success Metrics
+### 18.3 Success Metrics
 
 | Metric | Target |
 |--------|--------|
@@ -1128,7 +1501,7 @@ def call_external_api():
 
 ---
 
-## 16. Conclusion
+## 19. Conclusion
 
 The current SPCS integration requires teams to manage significant infrastructure complexity. A Modal.ai-style serverless interface would:
 
