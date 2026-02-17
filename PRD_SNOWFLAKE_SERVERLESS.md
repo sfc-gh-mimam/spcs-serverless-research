@@ -4,7 +4,36 @@
 **Status:** Draft
 **Last Updated:** February 2026
 **Stakeholders:** SPCS, Notebooks, Streamlit, Cortex, Platform Engineering
-**Decision Requested:** Approve funding and prioritize for H1 2026
+**Decision Requested:** Approve $2.5M funding and prioritize for H1 2026
+
+---
+
+## 📖 HOW TO READ THIS PRD
+
+**For Busy Executives (5-10 minutes):**
+Read "Executive Summary" only - contains the ask, problem, solution, financials, and recommendation.
+
+**For Product/Engineering Leaders (20-30 minutes):**
+Read Executive Summary + Sections 1-4:
+- Section 1: Detailed problem statement with evidence
+- Section 2: Current state analysis (how teams struggle today)
+- Section 3: Goals and requirements (what we must build and why)
+- Section 4: User personas and use cases (who needs what)
+
+**For Engineers/Architects (1-2 hours):**
+Read Sections 1-10:
+- Understand problem and requirements (Sections 1-4)
+- Review proposed solution and architecture (Sections 5-7)
+- Study implementation details and design decisions (Sections 8-10)
+
+**For Finance/Operations (15-20 minutes):**
+Read Executive Summary + Sections 11-13:
+- Section 11: Team composition and resource requirements
+- Section 12: Financial analysis and ROI calculation
+- Section 13: Risk assessment and mitigation plans
+
+**Document Flow:**
+Problem & Requirements → Solution & Architecture → Implementation Plan → Team & Budget → ROI & Risks
 
 ---
 
@@ -107,21 +136,141 @@ Today, Snowflake uses containers (Kubernetes/SPCS). If better tech emerges (micr
 
 ---
 
-## 1. Executive Summary
+## 1. Problem Statement (Detailed)
 
-### 1.1 Problem Statement
+### 1.1 The Core Problem: Infrastructure Complexity Slows Feature Delivery
 
-Internal Snowflake teams (Notebooks vNext, Streamlit/SiS, Cortex) spend significant engineering effort managing SPCS infrastructure instead of building product features. Currently, deploying code to SPCS requires:
+Internal Snowflake teams (Notebooks vNext, Streamlit/SiS, Cortex) spend **40% of engineering time** managing SPCS infrastructure instead of building product features.
 
+**What deploying to SPCS requires today:**
 - Writing 50+ lines of ServiceSpec YAML
-- Creating and managing compute pools
+- Creating and managing compute pools (sizing, auto-suspend configuration)
 - Building, pushing, and versioning container images
-- Implementing token refresh logic (60-min OAuth expiry)
-- Estimating CPU/memory/GPU requirements
+- Implementing token refresh logic (60-minute OAuth expiry)
+- Estimating CPU/memory/GPU requirements without tooling
+- Configuring networking, endpoints, volumes, secrets
+- Managing service lifecycle, monitoring, and debugging
 
-**This infrastructure burden slows down development and creates inconsistent patterns across teams.**
+**Result:** A 5-line Python function takes 30+ minutes and 50+ lines of infrastructure code to deploy.
 
-Additionally, **SPCS locks teams into the current container-based architecture**. There is no easy way to experiment with alternative execution models (microVMs, Firecracker, WebAssembly, etc.) without requiring every consumer team to rewrite their integration code. This architectural rigidity prevents the platform from evolving to adopt better technologies as they emerge.
+### 1.2 Architectural Lock-In Prevents Innovation
+
+**SPCS locks teams into the current container-based architecture (Kubernetes).** There is no easy way to experiment with alternative execution models without requiring every consumer team to rewrite their integration code:
+
+- **microVMs** (Firecracker, gVisor): 10x faster cold starts (<1s vs 30s), stronger isolation
+- **WebAssembly**: Near-native speed, extreme isolation for untrusted code
+- **Bare metal GPU**: Better utilization for large ML models
+- **Future technologies**: No path to adopt innovations as they emerge
+
+Teams currently hard-code SPCS APIs (ServiceSpec, compute pools, image registries) into their products. Migrating to a better backend means weeks of rewriting for every team.
+
+### 1.3 Who Is Affected and How
+
+| Team | Current Pain | Time Wasted | Impact |
+|------|--------------|-------------|--------|
+| **Notebooks vNext** | ServiceSpec for every notebook, token refresh, GPU pool management | 40% of 2 eng (1,600 hours/year) | Delayed interactive notebook features |
+| **Streamlit/SiS** | Bootstrap complexity, SPCS v2 migration, 4+ feature flags | 40% of 2 eng (1,600 hours/year) | Slower app deployment, poor cold start UX |
+| **Cortex** | Model deployment requires full SPCS config, image build overhead | 40% of 2 eng (1,600 hours/year) | Delayed ML features, slow model updates |
+
+**Combined Impact:**
+- 4,800 engineering hours/year spent on infrastructure = **$720K-$1M lost productivity**
+- Feature velocity: 6 features/quarter instead of potential 10+
+- Morale: Engineers frustrated managing infrastructure instead of building product
+- Competitive disadvantage: AWS Lambda, Modal.ai ship features faster
+
+### 1.4 Why This Matters Now
+
+1. **Competitive Pressure**: AWS Lambda, Modal.ai, Google Cloud Run offer serverless compute that makes deployment trivial. Data teams are adopting these platforms for ML workloads.
+
+2. **Internal Inefficiency**: 40% of 6 engineers' time = $1M/year wasted. This compounds as more teams need SPCS.
+
+3. **Technology Readiness**: microVMs (Firecracker, gVisor) are production-ready and offer 10x better cold starts than containers. We can't adopt them without breaking all existing integrations.
+
+4. **Strategic Alignment**: Snowflake's AI/ML strategy requires rapid feature iteration. Infrastructure complexity blocks this.
+
+5. **Customer Demand**: When we expose this to customers (Native Apps, general availability), current complexity will be a major adoption barrier.
+
+---
+
+## 2. Current State Analysis
+
+### 2.1 How Teams Use SPCS Today
+
+Teams integrating with SPCS must manage 8+ infrastructure concerns:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              DEVELOPER RESPONSIBILITIES (Current)                │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Compute Pool Management    CREATE COMPUTE POOL, sizing, DDL │
+│  2. Container Image Build      Dockerfile, build, push, version │
+│  3. ServiceSpec YAML (50+ lines)  containers, endpoints, volumes│
+│  4. Service Creation           CREATE SERVICE SQL statement     │
+│  5. Token Management           60-min OAuth refresh logic       │
+│  6. Endpoint Configuration     public/private, CORS, auth       │
+│  7. Scaling Configuration      min/max nodes, auto-suspend      │
+│  8. Monitoring & Debugging     logs, metrics, health checks     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Example: Deploying a Simple Python Function (Current SPCS)**
+
+```python
+# Step 1: Create compute pool (separate DDL, must estimate sizing)
+# CREATE COMPUTE POOL my_pool
+#   INSTANCE_FAMILY = CPU_X64_S
+#   MIN_NODES = 1
+#   MAX_NODES = 5
+#   AUTO_SUSPEND_SECS = 300
+
+# Step 2: Build and push container image (5-10 minutes)
+# docker build -t my-registry/my-function:v1 .
+# docker push my-registry/my-function:v1
+
+# Step 3: Write ServiceSpec YAML (50+ lines)
+service_spec = """
+spec:
+  containers:
+  - name: main
+    image: my-registry/my-function:v1
+    env:
+      KEY: value
+    resources:
+      requests:
+        memory: 4Gi
+        cpu: "2"
+      limits:
+        memory: 4Gi
+        cpu: "2"
+    readinessProbe:
+      port: 8080
+      path: /health
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  endpoints:
+  - name: api
+    port: 8080
+    public: true
+  volumes:
+  - name: data
+    source: "@my_stage"
+"""
+
+# Step 4: Create service (SQL)
+# CREATE SERVICE my_service
+#   IN COMPUTE POOL my_pool
+#   FROM SPECIFICATION $$service_spec$$
+
+# Step 5: Wait for ready, get endpoint (5+ minutes)
+# SELECT SYSTEM$GET_SERVICE_STATUS('my_service')
+# SHOW ENDPOINTS IN SERVICE my_service
+
+# Step 6: Implement token refresh logic (60-min expiry)
+# ...additional code for session management...
+
+# TOTAL: 30+ minutes, 50+ lines of code, 8 infrastructure concepts
+```
 
 ### 1.2 Proposed Solution
 
