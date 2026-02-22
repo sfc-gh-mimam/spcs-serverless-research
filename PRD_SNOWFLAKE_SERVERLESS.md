@@ -12,27 +12,29 @@
 
 ### The Problem
 
-Four internal Snowflake teams—Notebooks vNext, Streamlit vNext, ML Platform, and OpenFlow—currently spend approximately 40% of their engineering time managing SPCS infrastructure for simple code execution. As SPCS becomes the platform of choice for more teams (given limitations of other compute options), this problem will compound. Deploying a basic Python function today requires writing ServiceSpec YAML, creating compute pools, building container images, and implementing token refresh logic—a process that can take 30+ minutes.
+Four internal Snowflake teams—Notebooks vNext, Streamlit vNext, ML Platform, and OpenFlow—currently spend approximately 40% of their engineering time managing SPCS infrastructure. As SPCS becomes the platform of choice for more teams (given limitations of other compute options), this problem will compound.
+
+However, these teams have different needs. **Notebooks vNext and Streamlit vNext** simply need to run user code or containers—they don't require Kubernetes primitives like StatefulSets or inter-pod networking. Yet they still struggle with ServiceSpec YAML, compute pools, and 30+ minute deployment times. **ML Platform and OpenFlow** have hybrid needs: simple workloads (ML inference, basic ETL) could use a simpler interface, but complex distributed workloads (Ray clusters for training, Apache Nifi for streaming) genuinely need full Kubernetes access.
 
 Teams are also locked into Kubernetes containers with no easy path to adopt newer technologies like microVMs, which offer significantly faster cold starts. Because SPCS APIs are hard-coded into products, migrating to better execution models would require extensive code rewrites across all teams.
 
 ### The Solution
 
-We propose building a unified serverless interface using a decorator-based API (`@sf.function`) that simplifies deployment to just a few lines of code. Developers annotate their Python or Java functions with resource requirements, call `sf.deploy()`, and receive a production-ready endpoint—no YAML, no compute pools, no container management required.
+We propose building a unified serverless interface using a decorator-based API (`@sf.function`) that simplifies deployment to just a few lines of code. This targets workloads that just need to execute code or run containers—no Kubernetes primitives required. Developers annotate their Python or Java functions with resource requirements, call `sf.deploy()`, and receive a production-ready endpoint—no YAML, no compute pools, no container management required.
 
 The key architectural decision is backend abstraction. By decoupling the developer API from the execution infrastructure, teams can write code once and the platform can migrate between compute technologies (Kubernetes, microVMs, WebAssembly) without requiring code changes. This provides flexibility to adopt better execution models as they become available.
 
-As SPCS adoption grows across Snowflake, this serverless interface will become increasingly critical. It enables teams to leverage SPCS without the infrastructure burden, making the platform accessible to many more teams beyond the current four.
+**Who benefits:** Notebooks vNext and Streamlit vNext are ideal candidates (100% of their workloads). ML Platform and OpenFlow benefit for simple workloads (inference, basic tasks), while continuing to use SPCS directly for complex orchestration (Ray, Nifi). As SPCS adoption grows, this serverless interface makes the platform accessible to many more teams that just need code execution.
 
 ### Scope
 
-The platform targets user code execution: Python/Java functions, notebook runtimes, Streamlit applications, ML model serving, data processing jobs, and APIs. Complex orchestration frameworks like Ray, Temporal, Nifi, and Airflow will continue using SPCS directly, as they require Kubernetes primitives that serverless platforms don't provide.
+The platform targets **simple code/container execution**: Python/Java functions, notebook runtimes, Streamlit applications, ML model inference, data processing jobs, and APIs. **Complex orchestration frameworks** that need Kubernetes primitives—Ray (distributed training), Temporal (stateful workflows), Apache Nifi (stream processing), Airflow—will continue using SPCS directly.
 
-Our goals: reduce deployment from 50+ lines to 5 lines, cut deployment time from 30+ minutes to under 1 minute, and achieve 80% adoption across internal teams by Month 6.
+Our goals: reduce deployment from 50+ lines to 5 lines, cut deployment time from 30+ minutes to under 1 minute, and achieve 80% adoption across applicable workloads by Month 6.
 
 ### Timeline
 
-The rollout spans 12 months. Months 1-2 focus on internal alpha with Notebooks vNext and ML Platform. Months 3-4 expand to all four teams with GPU support and auto-scaling. Months 5-6 target internal GA with production monitoring. Months 7-8 introduce customer preview. Months 9-12 explore alternative backends like microVMs to validate that backend abstraction works in practice.
+The rollout spans 12 months. Months 1-2 focus on internal alpha with Notebooks vNext (simple code execution) and ML Platform (inference only). Months 3-4 expand to all four teams, distinguishing simple workloads (use serverless) from complex ones (use SPCS direct). Months 5-6 target internal GA with production monitoring. Months 7-8 introduce customer preview. Months 9-12 explore alternative backends like microVMs to validate that backend abstraction works in practice.
 
 ---
 
@@ -66,16 +68,47 @@ SPCS locks teams into Kubernetes containers. No path to adopt:
 
 Teams hard-code SPCS APIs into products. Migrating to better backends means weeks of rewriting.
 
-### 1.3 Affected Teams
+### 1.3 Affected Teams: Two Categories
 
-Based on codebase analysis, these teams actively use SPCS today and face significant complexity:
+Based on codebase analysis, SPCS users fall into two distinct categories with different needs:
 
-| Team | Current SPCS Usage | Key Pain Points | Time Wasted |
-|------|-------------------|-----------------|-------------|
-| **Notebooks vNext** | Direct SPCS via `SYSTEM$NOTEBOOKS_VNEXT_CREATE_*` | ServiceSpec YAML, per-user isolation, token refresh (60min), compute pool management | 40% of 2 engineers |
-| **Streamlit vNext** | Managed SPCS via `SYSTEM$STREAMLIT_BOOTSTRAP` | 4+ feature flags, bootstrap complexity, cold starts, token refresh | 40% of 2 engineers |
-| **ML Platform** | Direct SPCS via `SYSTEM$DEPLOY_MODEL`, `SYSTEM$EXECUTE_ML_JOB` | Image build time (3-5 min), deploy spec complexity, resource estimation | 40% of 2 engineers |
-| **OpenFlow** | SPCS as execution backend for workflow tasks | Orchestrating SPCS jobs, compute pool management, state tracking | 30% of 2 engineers |
+#### Category 1: Simple Code/Container Execution (Primary Serverless Candidates)
+
+These teams just need to run user code or containers without requiring Kubernetes primitives:
+
+| Team | Current SPCS Usage | Key Pain Points | Why Serverless Fits |
+|------|-------------------|-----------------|---------------------|
+| **Notebooks vNext** | Direct SPCS via `SYSTEM$NOTEBOOKS_VNEXT_CREATE_*` | ServiceSpec YAML, per-user isolation, token refresh (60min), compute pool management | Just needs to run Jupyter kernels - no K8s dependencies |
+| **Streamlit vNext** | Managed SPCS via `SYSTEM$STREAMLIT_BOOTSTRAP` | 4+ feature flags, bootstrap complexity, cold starts, token refresh | Just needs to run Python apps - no K8s dependencies |
+
+**Time Wasted:** 40% of 2 engineers per team (3,200 hours/year combined)
+
+**Serverless Value:** These teams are ideal candidates. They don't need Kubernetes features—they just need a simple way to run code with resource specs. Serverless eliminates all the SPCS complexity they face today.
+
+#### Category 2: Complex Orchestration Workloads (May Need SPCS Direct)
+
+These teams sometimes need cloud-native orchestration frameworks that require Kubernetes primitives:
+
+| Team | Current SPCS Usage | Key Pain Points | Nuance |
+|------|-------------------|-----------------|---------|
+| **ML Platform** | Direct SPCS via `SYSTEM$DEPLOY_MODEL`, `SYSTEM$EXECUTE_ML_JOB` | Image build time (3-5 min), deploy spec complexity, resource estimation | **Simple inference:** Can use serverless<br>**Distributed training with Ray:** Needs SPCS/K8s |
+| **OpenFlow** | SPCS as execution backend for workflow tasks | Orchestrating SPCS jobs, compute pool management, state tracking | **Simple tasks:** Can use serverless<br>**Complex workflows with Nifi:** Needs SPCS/K8s |
+
+**Time Wasted:** 40% of 2 engineers (ML) + 30% of 2 engineers (OpenFlow) = 3,200 hours/year combined
+
+**Serverless Value:** These teams have hybrid needs. For simple workloads (ML inference, basic ETL tasks), serverless is perfect. For complex distributed workloads (Ray clusters, Nifi pipelines), they should continue using SPCS directly with full Kubernetes access.
+
+#### Decision Framework
+
+```
+Does the workload need Kubernetes primitives?
+├─ NO → Use Serverless
+│   └─ Examples: Notebook kernels, Streamlit apps, ML inference, simple data processing
+│
+└─ YES → Use SPCS Direct
+    └─ Examples: Ray clusters (distributed training), Nifi pipelines (stateful streaming),
+                 Temporal (workflow orchestration), custom operators
+```
 
 **Note:** Cortex does NOT use SPCS - it uses managed services (`CREATE CORTEX SEARCH SERVICE`) and versioned stages, which is the model we should follow.
 
@@ -163,32 +196,59 @@ tasks:
 | **G4: Snowflake Native** | Direct table access, secrets, auth | Zero config overhead |
 | **G5: Backend Agnostic** | Pluggable execution backends | Zero migration time for backend switches |
 
-### 2.2 What We Support vs Don't
+### 2.2 What We Support vs Don't: Clear Distinction
 
-#### ✅ User Code Execution (In Scope)
+#### ✅ Simple Code/Container Execution (Serverless Platform)
 
-| Use Case | Examples |
-|----------|----------|
-| Python/Java functions | Data transformations, ML inference, APIs |
-| Notebook runtimes | Jupyter kernels, interactive sessions |
-| Streamlit apps | Dashboards, data apps |
-| ML model inference | Serving models, batch predictions |
-| Data processing | ETL, aggregations, analytics |
-| Scheduled tasks | Periodic jobs, cleanup |
+Workloads that just need to execute code or run containers—**no Kubernetes primitives required**:
 
-**Principle:** If it's user-written code that needs to execute, serverless handles it.
+| Use Case | Examples | Why Serverless Fits |
+|----------|----------|---------------------|
+| **Python/Java functions** | Data transformations, ML inference, APIs | Just code execution |
+| **Notebook runtimes** | Jupyter kernels, interactive Python/R sessions | Just code execution |
+| **Streamlit apps** | Dashboards, data apps | Just Python app serving |
+| **ML model inference** | Serving single models, batch predictions | Just inference endpoint |
+| **Data processing jobs** | ETL, aggregations, analytics | Just data transformation |
+| **Scheduled tasks** | Periodic jobs, cleanup scripts | Just timed execution |
 
-#### ❌ Complex Frameworks (Out of Scope)
+**Teams:** Notebooks vNext (100%), Streamlit vNext (100%), ML Platform inference (70%), OpenFlow simple tasks (60%)
 
-| Framework Type | Examples | Alternative |
-|----------------|----------|-------------|
-| Distributed ML runtimes | Ray, Dask, Spark | Use SPCS with K8s |
-| Workflow orchestrators | Temporal, Airflow, Prefect | Use OpenFlow or SPCS |
-| Stream processing | Flink, Nifi, Kafka Streams | Use SPCS with K8s |
-| Stateful services | Databases, caches, queues | Use Snowflake or SPCS |
-| Custom K8s workloads | StatefulSets, Operators | Use SPCS directly |
+#### ❌ Complex Orchestration (SPCS Direct with Kubernetes)
 
-**Principle:** Complex frameworks need Kubernetes primitives. Use SPCS directly.
+Workloads that need Kubernetes primitives—**StatefulSets, inter-pod networking, persistent volumes, operators**:
+
+| Framework Type | Examples | Why Kubernetes Needed | Alternative |
+|----------------|----------|----------------------|-------------|
+| **Distributed ML runtimes** | Ray (training), Dask, Spark | StatefulSets, inter-pod networking for distributed coordination | Use SPCS with K8s |
+| **Stream processing** | Apache Nifi, Flink, Kafka Streams | Stateful operators, persistent volumes, exactly-once semantics | Use SPCS with K8s |
+| **Workflow orchestrators** | Temporal, Airflow (complex) | Persistent state, long-running workflows, custom operators | Use SPCS with K8s |
+| **Stateful services** | Databases, caches, queues | Persistent volumes, clustering, replication | Use SPCS with K8s |
+| **Custom K8s workloads** | StatefulSets, DaemonSets, Operators | Full Kubernetes API access | Use SPCS directly |
+
+**Teams:** ML Platform Ray training (30%), OpenFlow Nifi pipelines (40%)
+
+#### 🔀 Decision Tree
+
+```
+Does your workload need Kubernetes primitives?
+(StatefulSets, inter-pod networking, persistent volumes, operators)
+│
+├─ NO → Use Serverless Platform
+│   ├─ Just running code? → Serverless
+│   ├─ Just serving HTTP? → Serverless
+│   ├─ Just processing data? → Serverless
+│   └─ Examples: Notebooks, Streamlit apps, ML inference, basic ETL
+│
+└─ YES → Use SPCS Direct with Kubernetes
+    ├─ Need distributed coordination? (Ray) → SPCS/K8s
+    ├─ Need stateful streaming? (Nifi) → SPCS/K8s
+    ├─ Need custom operators? (Temporal) → SPCS/K8s
+    └─ Examples: Ray clusters, Nifi pipelines, Temporal workflows
+```
+
+**Key Distinction:**
+- **Serverless = Code execution** (run my function, serve my app, process my data)
+- **SPCS Direct = Framework hosting** (run Ray cluster, run Nifi pipeline, need K8s features)
 
 ### 2.3 Non-Functional Requirements
 
@@ -204,46 +264,65 @@ tasks:
 
 ## 3. User Personas
 
-### 3.1 Primary: Internal Platform Teams (Confirmed SPCS Users)
+### 3.1 Category 1: Simple Code Execution Teams (100% Serverless Candidates)
 
 **Notebooks vNext Team**
 - **Current SPCS Usage:** Direct integration via `SYSTEM$NOTEBOOKS_VNEXT_CREATE_INTERACTIVE/NON_INTERACTIVE`
+- **Workload Type:** Simple code execution - Jupyter kernels running Python/R code
+- **Needs Kubernetes?** NO - Just needs to run notebook kernels with GPU support
 - **Needs:** Deploy notebook runtimes, GPU support, long-running sessions (hours), per-user isolation
 - **Pain Points:**
   - ServiceSpec YAML for every notebook type
   - Token refresh every 60 minutes for long sessions
   - Per-user service creation (expensive resource overhead)
   - Custom container image maintenance
+- **Serverless Fit:** 100% - All workloads are simple code execution
 - **Success:** Deploy notebook kernel in <1 minute, no YAML, automatic token refresh
 
 **Streamlit vNext Team**
 - **Current SPCS Usage:** Managed SPCS via `SYSTEM$STREAMLIT_BOOTSTRAP`
+- **Workload Type:** Simple container execution - Python apps serving web traffic
+- **Needs Kubernetes?** NO - Just needs to run Python apps with auto-scaling
 - **Needs:** Deploy Streamlit apps, fast cold start (<5s), concurrent users, CDN integration
 - **Pain Points:**
   - 4+ feature flags required (`ENABLE_STREAMLIT_SPCS_RUNTIME_V2`, etc.)
   - Complex bootstrap flow (job creation, timeout handling, state management)
   - Service lifecycle tied to Streamlit object
   - Cold start latency on first load
+- **Serverless Fit:** 100% - All workloads are simple Python app execution
 - **Success:** Deploy app in <1 minute, <5s cold start, zero feature flags
+
+### 3.2 Category 2: Hybrid Workload Teams (Partial Serverless Candidates)
 
 **ML Platform Team**
 - **Current SPCS Usage:** Direct SPCS via `SYSTEM$DEPLOY_MODEL`, `SYSTEM$EXECUTE_ML_JOB`
-- **Needs:** Deploy ML models for inference, run training jobs, GPU support (A10G, H100), batch predictions
+- **Workload Types:**
+  - **Simple:** ML inference (single model serving) - 70% of workloads
+  - **Complex:** Distributed training with Ray clusters - 30% of workloads
+- **Needs Kubernetes?**
+  - NO for inference (just serving predictions)
+  - YES for distributed training (Ray needs K8s primitives: StatefulSets, inter-pod networking)
 - **Pain Points:**
   - Image build time: 3-5 minutes for PyTorch/TensorFlow
   - Complex deploy spec (YAML with models, image_build, service configs)
   - Resource estimation guesswork (CPU, memory, GPU, batch size, workers)
-  - Multiple system functions for different operations
-- **Success:** Deploy model endpoint in <1 minute, automatic resource estimation, A10G/H100 support
+- **Serverless Fit:** 70% - Inference workloads benefit, Ray training continues with SPCS direct
+- **Success:** Deploy model endpoint in <1 minute for inference; Ray training stays on SPCS/K8s
 
 **OpenFlow Team**
 - **Current SPCS Usage:** SPCS as execution backend for workflow orchestration
-- **Needs:** Orchestrate multi-step pipelines, coordinate SPCS jobs/services, handle dependencies and retries
+- **Workload Types:**
+  - **Simple:** Basic ETL tasks, data transformations - 60% of workloads
+  - **Complex:** Apache Nifi streaming pipelines - 40% of workloads
+- **Needs Kubernetes?**
+  - NO for simple tasks (just data processing)
+  - YES for Nifi pipelines (needs stateful stream processing, persistent volumes)
 - **Pain Points:**
   - Each workflow step requires full SPCS configuration
   - Compute pool management across multiple tasks
   - State tracking and failure handling complexity
-  - Long DAG deployment times (minutes per workflow)
+- **Serverless Fit:** 60% - Simple tasks benefit, Nifi pipelines continue with SPCS direct
+- **Success:** Define simple workflow tasks as Python functions; Nifi stays on SPCS/K8s
 - **Success:** Define workflow as Python functions, deploy entire DAG in <3 minutes, automatic state management
 
 ### 3.2 Cortex Team (NOT a SPCS user - reference model)
