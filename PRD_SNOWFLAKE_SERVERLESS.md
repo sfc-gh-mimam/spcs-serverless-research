@@ -10,27 +10,41 @@
 
 ## Executive Summary
 
-### Problem
-Internal teams (Notebooks vNext, Streamlit vNext, ML Platform, OpenFlow) waste 40% of engineering time managing SPCS infrastructure for simple code execution. Deploying a 5-line Python function requires 50+ lines of ServiceSpec YAML, 30+ minutes, and deep Kubernetes knowledge.
+### The Problem
 
-### Solution
-Build a unified serverless interface (`@sf.function` decorator API) that reduces deployment from 50+ lines to 5 lines and time-to-deploy from 30 minutes to <1 minute. The platform abstracts execution backends, enabling transparent migration to faster technologies (microVMs, WebAssembly) without code changes.
+Four internal Snowflake teams—Notebooks vNext, Streamlit vNext, ML Platform, and OpenFlow—are wasting 40% of their engineering time managing SPCS infrastructure for simple code execution instead of building product features. Today, deploying a basic 5-line Python function requires writing 50+ lines of ServiceSpec YAML, creating compute pools, building container images, implementing token refresh logic, and navigating deep Kubernetes complexity. This deployment process takes 30+ minutes when it should take seconds.
 
-### Scope
-- **✅ In Scope:** User code execution (Python/Java functions, notebooks, Streamlit apps, ML inference, data processing, APIs)
-- **❌ Out of Scope:** Complex orchestration frameworks (Ray, Temporal, Nifi, Airflow) - these should use SPCS directly with full Kubernetes access
+The impact is severe: 6,400 engineering hours per year are lost to infrastructure busywork, costing the company $960K-$1.3M annually in lost productivity. Teams ship only 6 features per quarter when they could deliver 10+. Engineers are frustrated managing infrastructure instead of innovating on product. Meanwhile, competitors like AWS Lambda and Modal.ai ship features faster because they don't burden developers with infrastructure complexity.
 
-### Key Goals
-- **90% code reduction:** From 50+ lines to 5 lines
-- **97% faster deployment:** From 30 minutes to <1 minute
-- **Backend flexibility:** Switch from K8s → microVMs without code changes
-- **80% adoption:** Internal teams using serverless by Month 6
+Beyond the immediate productivity loss, teams are architecturally locked into Kubernetes containers with no path to adopt emerging technologies. MicroVMs like Firecracker offer 10x faster cold starts (under 1 second vs 30 seconds), but migrating would require weeks of rewriting code across all four teams because they've hard-coded SPCS APIs into their products.
 
-### Timeline
-- **Months 1-4:** Internal alpha/beta (Python functions, basic tiers)
-- **Months 5-6:** Internal GA (80% adoption target)
-- **Months 7-8:** Customer preview
-- **Months 9-12:** Alternative backends (microVMs)
+### The Solution
+
+We propose building a unified serverless interface using a decorator-based API (`@sf.function`) that eliminates infrastructure complexity and reduces deployment from 50+ lines of code to just 5 lines. Time-to-deploy drops from 30 minutes to under 1 minute. Developers simply annotate their Python or Java functions with resource requirements (CPU, memory, GPU), call `sf.deploy()`, and receive a production-ready endpoint—no YAML, no compute pools, no container management.
+
+The platform's key innovation is backend abstraction. By decoupling the developer API from the execution infrastructure, we enable transparent migration between compute technologies. Teams write their code once, and the platform can switch from Kubernetes to microVMs to WebAssembly without requiring any code changes. This future-proofs our investment and positions Snowflake to adopt faster, cheaper execution models as they emerge.
+
+The solution is designed specifically for user code execution: Python/Java functions, notebook runtimes, Streamlit apps, ML model inference, data processing jobs, and APIs. Complex orchestration frameworks like Ray, Temporal, Apache Nifi, and Airflow will continue using SPCS directly with full Kubernetes access, as they require stateful primitives that serverless platforms aren't designed to provide.
+
+### Scope & Goals
+
+This platform targets user code execution workloads. We will support Python and Java functions, Jupyter notebook kernels, Streamlit applications, ML model serving, batch data processing, and scheduled tasks. Our goal is 90% code reduction (50+ lines to 5 lines), 97% faster deployment (30 minutes to under 1 minute), automatic scaling from zero to thousands of instances, and seamless backend migration capability.
+
+We explicitly will not support complex orchestration frameworks (Ray, Temporal, Nifi, Airflow), stateful services (databases, caches), or custom Kubernetes workloads (StatefulSets, Operators). These use cases require Kubernetes primitives and should continue using SPCS directly. This focused scope allows us to deliver exceptional developer experience for the 80% use case while avoiding over-engineering for edge cases.
+
+Our target is 80% adoption across all four internal teams by Month 6, with 150+ deployed functions handling production workloads, demonstrating 320 hours per month of engineering time saved, and achieving 90%+ developer satisfaction scores.
+
+### Implementation Timeline
+
+The rollout spans 12 months across five phases. Months 1-2 focus on internal alpha with Notebooks vNext and ML Platform teams, validating the core API with Python functions and basic resource tiers. Months 3-4 expand to internal beta with all four teams, adding GPU support (A10G), auto-scaling, and cost attribution dashboards.
+
+Months 5-6 target internal GA with 80% adoption, production monitoring, and migration tooling to help teams transition from existing SPCS deployments. Months 7-8 introduce customer preview with select beta customers to validate pricing and gather feedback. Months 9-12 focus on alternative execution backends, specifically microVM experimentation with Firecracker to achieve sub-second cold starts and prove that backend abstraction works—teams benefit from better performance without changing a single line of code.
+
+### Expected Impact
+
+Success means recovering 6,400 engineering hours per year currently wasted on infrastructure management, delivering $1.3M in annual productivity savings. Teams will ship 67% more features per quarter (from 6 to 10+), with deployment friction eliminated as a bottleneck. Developer satisfaction will exceed 90% as engineers spend time building product instead of fighting YAML configs.
+
+Strategically, this positions Snowflake competitively against AWS Lambda and Modal.ai while enabling our AI/ML product roadmap by making it trivial to deploy models, notebooks, and apps. The backend abstraction layer future-proofs our architecture, allowing us to adopt microVMs, WebAssembly, or other innovations transparently as they mature. Within 14 months, the platform pays for itself through productivity gains alone.
 
 ---
 
