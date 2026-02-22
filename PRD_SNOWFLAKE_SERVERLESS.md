@@ -47,11 +47,13 @@ Approve **$2.5M investment** (10 FTEs × 12 months) to build a serverless comput
 Internal teams (Notebooks, Streamlit, Cortex) waste **40% of engineering time** managing SPCS infrastructure instead of building features. Current deployment requires 50+ lines of code, 30+ minutes, and deep infrastructure knowledge. Teams are locked into Kubernetes containers with no path to adopt faster execution models (microVMs, Firecracker).
 
 ### The Solution
-Build a **unified serverless interface** (`@sf.function` decorator API) that:
+Build a **unified serverless interface** (`@sf.function` decorator API) for **user code execution** that:
 - Reduces deployment from 50+ lines to 5 lines (90% reduction)
 - Cuts time-to-deploy from 30 minutes to <1 minute (97% faster)
 - Abstracts execution backend, enabling transparent migration to microVMs (10x faster cold starts) without code changes
 - Provides automatic scaling, monitoring, and cost attribution
+
+**Scope:** This platform is designed for running **user-written code** (Python/Java functions, notebooks, Streamlit apps, ML inference). For complex orchestration frameworks (Ray, Temporal, Apache Nifi, Airflow), users should continue using **SPCS directly with full Kubernetes access**.
 
 ### Business Case
 
@@ -102,7 +104,7 @@ Build a **unified serverless interface** (`@sf.function` decorator API) that:
 2. **Partner with Modal.ai**: Loses control, not Snowflake-native, no data access integration
 3. **Improve SPCS docs/tooling**: Doesn't solve fundamental complexity, no backend flexibility
 
-**Recommendation**: Build unified serverless interface with backend abstraction. This is the only approach that solves current pain AND enables future innovation.
+**Recommendation**: Build unified serverless interface with backend abstraction for **user code execution**. This solves current pain AND enables future innovation. For orchestration frameworks (Ray, Temporal, Nifi), SPCS with direct Kubernetes access remains the right solution.
 
 ---
 
@@ -141,9 +143,9 @@ Today, Snowflake uses containers (Kubernetes/SPCS). If better tech emerges (micr
 
 ### 1.1 The Core Problem: Infrastructure Complexity Slows Feature Delivery
 
-Internal Snowflake teams (Notebooks vNext, Streamlit/SiS, Cortex) spend **40% of engineering time** managing SPCS infrastructure instead of building product features.
+Internal Snowflake teams (Notebooks vNext, Streamlit/SiS, Cortex) spend **40% of engineering time** managing SPCS infrastructure for **simple code execution** instead of building product features.
 
-**What deploying to SPCS requires today:**
+**What deploying user code to SPCS requires today:**
 - Writing 50+ lines of ServiceSpec YAML
 - Creating and managing compute pools (sizing, auto-suspend configuration)
 - Building, pushing, and versioning container images
@@ -190,6 +192,29 @@ Teams currently hard-code SPCS APIs (ServiceSpec, compute pools, image registrie
 4. **Strategic Alignment**: Snowflake's AI/ML strategy requires rapid feature iteration. Infrastructure complexity blocks this.
 
 5. **Customer Demand**: When we expose this to customers (Native Apps, general availability), current complexity will be a major adoption barrier.
+
+---
+
+> **📌 IMPORTANT: Scope Clarification**
+>
+> This serverless platform is designed for **user code execution** (Python/Java functions, notebooks, apps, ML inference).
+>
+> **✅ Use Serverless For:**
+> - Data transformations and processing jobs
+> - ML model inference and batch predictions
+> - Streamlit apps and dashboards
+> - Notebook runtimes (Jupyter kernels)
+> - APIs and microservices
+> - Scheduled tasks and ETL jobs
+>
+> **❌ Use SPCS Directly (with Kubernetes) For:**
+> - Distributed ML runtimes (Ray, Dask, Spark)
+> - Workflow orchestrators (Temporal, Airflow, Prefect)
+> - Stream processing frameworks (Apache Flink, Nifi, Kafka Streams)
+> - Stateful services (databases, caches, queues)
+> - Custom Kubernetes workloads (StatefulSets, Operators)
+>
+> **Why the distinction?** Complex frameworks need Kubernetes primitives (inter-pod networking, StatefulSets, persistent volumes, operators). The serverless platform optimizes for **simple code execution**, not framework hosting.
 
 ---
 
@@ -359,14 +384,63 @@ No compute pools. No ServiceSpec. No images. **This is the model to follow.**
 | **G6: Production Ready** | Auto-scaling, monitoring, cost attribution built-in |
 | **G7: Backend Agnostic** | Unified interface allows switching execution models (Kubernetes → microVMs → Firecracker) without code changes |
 
-### 3.2 Non-Goals (V1)
+### 3.2 What We Support vs What We Don't
+
+#### ✅ In Scope: User Code Execution
+
+The serverless platform is designed for **running user-written code** as functions:
+
+| Use Case | Examples | Why It Fits |
+|----------|----------|-------------|
+| **Python/Java functions** | Data transformations, ML inference, APIs | Direct code execution |
+| **Notebook runtimes** | Jupyter kernels, interactive sessions | User code in notebooks |
+| **Streamlit apps** | Dashboard applications, data apps | User-written Python apps |
+| **ML model inference** | Serving trained models, batch predictions | User code wrapping models |
+| **Data processing jobs** | ETL, aggregations, custom analytics | User-written transformations |
+| **Scheduled tasks** | Periodic data refreshes, cleanup jobs | User code on a schedule |
+
+**Key Principle:** If it's **user-written Python/Java/SQL code** that needs to execute, the serverless platform handles it.
+
+#### ❌ Out of Scope: Complex Orchestration Frameworks
+
+The serverless platform is **NOT** designed to run complex open-source orchestration or runtime frameworks:
+
+| Framework Type | Examples | Why It Doesn't Fit | Alternative |
+|----------------|----------|-------------------|-------------|
+| **Distributed ML runtimes** | Ray, Dask, Spark | Require cluster management, inter-node communication, stateful coordination | Use SPCS directly with Kubernetes |
+| **Workflow orchestrators** | Temporal, Apache Airflow, Prefect | Need persistent state, long-running workflows, complex scheduling | Use OpenFlow or SPCS directly |
+| **Stream processing** | Apache Flink, Apache Nifi, Kafka Streams | Require stateful stream processing, exactly-once semantics | Use SPCS directly with Kubernetes |
+| **Database systems** | PostgreSQL, Redis, Elasticsearch | Need persistent storage, clustering, replication | Use Snowflake or SPCS directly |
+| **Custom K8s workloads** | StatefulSets, DaemonSets, Operators | Need full Kubernetes API access | Use SPCS directly |
+
+**Key Principle:** If it's a **complex framework or stateful system** that needs Kubernetes primitives (StatefulSets, operators, inter-pod networking), use **SPCS directly with Kubernetes**.
+
+#### 🔀 Decision Tree: Serverless vs SPCS Direct
+
+```
+Is it user-written code that just needs to execute?
+├─ YES → Use Serverless Platform (@sf.function)
+│   └─ Examples: ML inference, data transforms, APIs, Streamlit apps
+│
+└─ NO → Is it an open-source framework or cloud-native system?
+    └─ YES → Use SPCS directly (full Kubernetes access)
+        └─ Examples: Ray clusters, Temporal, Airflow, Flink, custom operators
+```
+
+**Summary:**
+- **Serverless = Code execution** (your Python/Java functions, apps, notebooks)
+- **SPCS Direct = Framework hosting** (Ray, Temporal, Nifi, etc.)
+
+### 3.3 Non-Goals (V1)
 
 | Non-Goal | Rationale |
 |----------|-----------|
-| Replace SPCS entirely | Power users may still need direct SPCS access |
-| Support all SPCS features | Focus on 80% use case first |
+| Replace SPCS entirely | Power users and framework deployments still need direct SPCS/K8s access |
+| Support all SPCS features | Focus on 80% use case (code execution) first |
+| Run orchestration frameworks (Ray, Temporal, Nifi) | These need full Kubernetes primitives - direct SPCS is the right solution |
 | Multi-cloud parity | Start with AWS, expand later |
 | Custom networking | Use standard Snowflake networking |
+| Stateful services | Serverless is for stateless code execution; use SPCS for databases/caches |
 
 ---
 
@@ -396,7 +470,12 @@ No compute pools. No ServiceSpec. No images. **This is the model to follow.**
 
 ## 5. Proposed Solution
 
-### 5.1 Core Concept
+### 5.1 Core Concept: Serverless for User Code Execution
+
+The serverless platform provides a simple decorator-based API for deploying **user-written code** (Python/Java functions, notebooks, Streamlit apps, ML models). The platform handles all infrastructure complexity behind the scenes.
+
+**What it does:** Runs your code with automatic scaling, monitoring, and cost attribution.
+**What it doesn't do:** Host complex orchestration frameworks (Ray, Temporal, Nifi) - use SPCS directly for those.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -605,6 +684,8 @@ endpoint = sf.container(
 ## 6. Technical Architecture
 
 ### 6.1 System Components
+
+**Design for user code execution**, not framework hosting. The architecture optimizes for fast deployment of Python/Java functions, notebooks, and apps.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
