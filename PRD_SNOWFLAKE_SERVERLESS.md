@@ -12,7 +12,7 @@
 
 ### The Problem
 
-Four internal Snowflake teams—Notebooks vNext, Streamlit vNext, ML Platform, and OpenFlow—spend significant engineering time managing SPCS infrastructure for simple code execution. Deploying a basic Python function today requires writing ServiceSpec YAML, creating compute pools, building container images, and implementing token refresh logic. This process takes 30+ minutes when it should take seconds.
+Four internal Snowflake teams—Notebooks vNext, Streamlit vNext, ML Platform, and OpenFlow—currently spend approximately 40% of their engineering time managing SPCS infrastructure for simple code execution. As SPCS becomes the platform of choice for more teams (given limitations of other compute options), this problem will compound. Deploying a basic Python function today requires writing ServiceSpec YAML, creating compute pools, building container images, and implementing token refresh logic—a process that can take 30+ minutes.
 
 Teams are also locked into Kubernetes containers with no easy path to adopt newer technologies like microVMs, which offer significantly faster cold starts. Because SPCS APIs are hard-coded into products, migrating to better execution models would require extensive code rewrites across all teams.
 
@@ -22,11 +22,13 @@ We propose building a unified serverless interface using a decorator-based API (
 
 The key architectural decision is backend abstraction. By decoupling the developer API from the execution infrastructure, teams can write code once and the platform can migrate between compute technologies (Kubernetes, microVMs, WebAssembly) without requiring code changes. This provides flexibility to adopt better execution models as they become available.
 
+As SPCS adoption grows across Snowflake, this serverless interface will become increasingly critical. It enables teams to leverage SPCS without the infrastructure burden, making the platform accessible to many more teams beyond the current four.
+
 ### Scope
 
 The platform targets user code execution: Python/Java functions, notebook runtimes, Streamlit applications, ML model serving, data processing jobs, and APIs. Complex orchestration frameworks like Ray, Temporal, Nifi, and Airflow will continue using SPCS directly, as they require Kubernetes primitives that serverless platforms don't provide.
 
-Our goals are simple: reduce deployment from 50+ lines to 5 lines, cut deployment time from 30 minutes to under 1 minute, and achieve 80% adoption across internal teams by Month 6.
+Our goals: reduce deployment from 50+ lines to 5 lines, cut deployment time from 30+ minutes to under 1 minute, and achieve 80% adoption across internal teams by Month 6.
 
 ### Timeline
 
