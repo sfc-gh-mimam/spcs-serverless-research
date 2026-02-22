@@ -4,14 +4,14 @@
 **Status:** Draft
 **Last Updated:** February 21, 2026
 **Target Audience:** Engineering & Product Teams
-**Stakeholders:** SPCS, Notebooks, Streamlit, Cortex, Platform Engineering
+**Stakeholders:** SPCS, Notebooks vNext, Streamlit vNext, ML Platform, OpenFlow, Platform Engineering
 
 ---
 
 ## Executive Summary
 
 ### Problem
-Internal teams (Notebooks, Streamlit, Cortex) waste 40% of engineering time managing SPCS infrastructure for simple code execution. Deploying a 5-line Python function requires 50+ lines of YAML, 30+ minutes, and deep Kubernetes knowledge.
+Internal teams (Notebooks vNext, Streamlit vNext, ML Platform, OpenFlow) waste 40% of engineering time managing SPCS infrastructure for simple code execution. Deploying a 5-line Python function requires 50+ lines of ServiceSpec YAML, 30+ minutes, and deep Kubernetes knowledge.
 
 ### Solution
 Build a unified serverless interface (`@sf.function` decorator API) that reduces deployment from 50+ lines to 5 lines and time-to-deploy from 30 minutes to <1 minute. The platform abstracts execution backends, enabling transparent migration to faster technologies (microVMs, WebAssembly) without code changes.
@@ -49,8 +49,9 @@ Internal teams spend **40% of engineering time** managing SPCS infrastructure fo
 - Networking, endpoints, volumes, secrets configuration
 
 **Impact:**
-- 4,800 engineering hours/year wasted on infrastructure
-- 6 features/quarter instead of potential 10+
+- **6,400 engineering hours/year wasted** on infrastructure (Notebooks: 1,600h + Streamlit: 1,600h + ML: 1,600h + OpenFlow: 1,600h)
+- **$960K-$1.3M lost productivity** annually ($150-200/hour fully loaded cost)
+- 6 features/quarter instead of potential 10+ (across all 4 teams)
 - Engineers frustrated managing infrastructure vs building product
 - Competitive disadvantage vs AWS Lambda, Modal.ai
 
@@ -65,11 +66,86 @@ Teams hard-code SPCS APIs into products. Migrating to better backends means week
 
 ### 1.3 Affected Teams
 
-| Team | Time Wasted | Impact |
-|------|-------------|--------|
-| **Notebooks** | 40% of 2 engineers | Delayed interactive features |
-| **Streamlit** | 40% of 2 engineers | Slow app deployment, poor cold start UX |
-| **Cortex** | 40% of 2 engineers | Delayed ML features, slow model updates |
+Based on codebase analysis, these teams actively use SPCS today and face significant complexity:
+
+| Team | Current SPCS Usage | Key Pain Points | Time Wasted |
+|------|-------------------|-----------------|-------------|
+| **Notebooks vNext** | Direct SPCS via `SYSTEM$NOTEBOOKS_VNEXT_CREATE_*` | ServiceSpec YAML, per-user isolation, token refresh (60min), compute pool management | 40% of 2 engineers |
+| **Streamlit vNext** | Managed SPCS via `SYSTEM$STREAMLIT_BOOTSTRAP` | 4+ feature flags, bootstrap complexity, cold starts, token refresh | 40% of 2 engineers |
+| **ML Platform** | Direct SPCS via `SYSTEM$DEPLOY_MODEL`, `SYSTEM$EXECUTE_ML_JOB` | Image build time (3-5 min), deploy spec complexity, resource estimation | 40% of 2 engineers |
+| **OpenFlow** | SPCS as execution backend for workflow tasks | Orchestrating SPCS jobs, compute pool management, state tracking | 30% of 2 engineers |
+
+**Note:** Cortex does NOT use SPCS - it uses managed services (`CREATE CORTEX SEARCH SERVICE`) and versioned stages, which is the model we should follow.
+
+### 1.4 Current SPCS Usage Examples (From Codebase)
+
+#### Notebooks vNext: Direct SPCS Integration
+
+```python
+# Current approach - Complex
+class NotebookServiceAPI:
+    def create(self, schema_name, service_name, compute_pool_name, service_spec, is_interactive=True):
+        if is_interactive:
+            return self.hybrid_executor.execute_query(
+                f"select SYSTEM$NOTEBOOKS_VNEXT_CREATE_INTERACTIVE('{schema_name}', '{service_name}', '{compute_pool_name}', ${service_spec.to_yaml()}$)"
+            )
+        # Requires: ServiceSpec YAML, compute pool, custom container image
+        # Problem: Per-user services, token refresh, manual pool management
+```
+
+#### Streamlit vNext: Managed SPCS with Bootstrap
+
+```python
+# Current approach - Feature flags + bootstrap complexity
+# Requires 4+ feature flags:
+# - ENABLE_STREAMLIT_SPCS_RUNTIME_V2
+# - ENABLE_STREAMLIT_SPCS_RUNTIME
+# - ENABLE_SNOWSERVICES_USER_FACING_FEATURES
+# - ENABLE_STREAMLIT_PASS_ALTER_PROPERTIES_TO_SPCS_SERVICE
+
+result = execute_query(f"SYSTEM$STREAMLIT_BOOTSTRAP('{streamlit_name}', '{session_id}')")
+# Returns bootstrap JSON after multi-step job creation
+# Problem: Complex state management, cold start latency, token refresh
+```
+
+#### ML Platform: Deploy Model with SPCS
+
+```yaml
+# Current approach - Complex YAML spec
+models:
+  - name: "my_model"
+    version: "v1"
+
+image_build:
+  compute_pool: "GPU_POOL"
+  image_repo: "repo.snowflakecomputing.com/db/schema/repo"
+  force_rebuild: true
+
+service:
+  name: "model_service"
+  compute_pool: "GPU_INFERENCE_POOL"
+  max_instances: 1
+  cpu: "4"
+  num_workers: 1
+  max_batch_rows: 1000
+
+# Problems: Image build 3-5 min, resource guessing, complex YAML
+```
+
+#### OpenFlow: Orchestrating SPCS Tasks
+
+```yaml
+# Current approach - Full SPCS config per workflow task
+tasks:
+  - id: train_model
+    type: spcs_training
+    config:
+      compute_pool: GPU_POOL
+      image: pytorch-trainer:v1
+      gpu: "A10G"
+      command: ["python", "train.py"]
+      # Problems: Compute pool management, state tracking, long deployment
+```
 
 ---
 
@@ -126,24 +202,56 @@ Teams hard-code SPCS APIs into products. Migrating to better backends means week
 
 ## 3. User Personas
 
-### 3.1 Primary: Internal Platform Teams
+### 3.1 Primary: Internal Platform Teams (Confirmed SPCS Users)
 
-**Notebooks Team**
-- **Needs:** Deploy notebook runtimes, GPU support, long sessions
-- **Pain:** ServiceSpec complexity, token refresh, per-user isolation
-- **Success:** Deploy notebook kernel in <1 minute, no YAML
+**Notebooks vNext Team**
+- **Current SPCS Usage:** Direct integration via `SYSTEM$NOTEBOOKS_VNEXT_CREATE_INTERACTIVE/NON_INTERACTIVE`
+- **Needs:** Deploy notebook runtimes, GPU support, long-running sessions (hours), per-user isolation
+- **Pain Points:**
+  - ServiceSpec YAML for every notebook type
+  - Token refresh every 60 minutes for long sessions
+  - Per-user service creation (expensive resource overhead)
+  - Custom container image maintenance
+- **Success:** Deploy notebook kernel in <1 minute, no YAML, automatic token refresh
 
-**Streamlit Team**
-- **Needs:** Deploy apps, fast cold start, concurrent users
-- **Pain:** Feature flags, compute pool management, scaling
-- **Success:** Deploy Streamlit app in <1 minute, <5s cold start
+**Streamlit vNext Team**
+- **Current SPCS Usage:** Managed SPCS via `SYSTEM$STREAMLIT_BOOTSTRAP`
+- **Needs:** Deploy Streamlit apps, fast cold start (<5s), concurrent users, CDN integration
+- **Pain Points:**
+  - 4+ feature flags required (`ENABLE_STREAMLIT_SPCS_RUNTIME_V2`, etc.)
+  - Complex bootstrap flow (job creation, timeout handling, state management)
+  - Service lifecycle tied to Streamlit object
+  - Cold start latency on first load
+- **Success:** Deploy app in <1 minute, <5s cold start, zero feature flags
 
-**Cortex Team**
-- **Needs:** Deploy ML models, inference endpoints, batch jobs
-- **Pain:** GPU provisioning, resource estimation, image management
-- **Success:** Deploy model endpoint in <1 minute, A10G/H100 support
+**ML Platform Team**
+- **Current SPCS Usage:** Direct SPCS via `SYSTEM$DEPLOY_MODEL`, `SYSTEM$EXECUTE_ML_JOB`
+- **Needs:** Deploy ML models for inference, run training jobs, GPU support (A10G, H100), batch predictions
+- **Pain Points:**
+  - Image build time: 3-5 minutes for PyTorch/TensorFlow
+  - Complex deploy spec (YAML with models, image_build, service configs)
+  - Resource estimation guesswork (CPU, memory, GPU, batch size, workers)
+  - Multiple system functions for different operations
+- **Success:** Deploy model endpoint in <1 minute, automatic resource estimation, A10G/H100 support
 
-### 3.2 Secondary: Snowflake Customers (Future)
+**OpenFlow Team**
+- **Current SPCS Usage:** SPCS as execution backend for workflow orchestration
+- **Needs:** Orchestrate multi-step pipelines, coordinate SPCS jobs/services, handle dependencies and retries
+- **Pain Points:**
+  - Each workflow step requires full SPCS configuration
+  - Compute pool management across multiple tasks
+  - State tracking and failure handling complexity
+  - Long DAG deployment times (minutes per workflow)
+- **Success:** Define workflow as Python functions, deploy entire DAG in <3 minutes, automatic state management
+
+### 3.2 Cortex Team (NOT a SPCS user - reference model)
+
+**Why Cortex is not included:**
+- Cortex uses **managed services** (`CREATE CORTEX SEARCH SERVICE`) and versioned stages
+- No ServiceSpec YAML, no compute pools, no container images
+- Single SQL statement deployment - **this is the developer experience we want to replicate**
+
+### 3.3 Secondary: Snowflake Customers (Future)
 
 - Data scientists deploying ML models
 - Developers building APIs on Snowflake data
@@ -420,8 +528,13 @@ class WasmBackend(ExecutionBackend):
 - SPCS backend only
 - Limited to 10 functions per team
 
+**Alpha Teams:**
+- **Notebooks vNext** (primary) - Interactive notebook kernels
+- **ML Platform** (secondary) - Model inference endpoints
+
 **Success Criteria:**
-- 10+ functions deployed by Notebooks team
+- 10+ functions deployed by Notebooks vNext team
+- 5+ model endpoints deployed by ML Platform team
 - 90% code reduction achieved
 - <1 minute deployment time (P95)
 - Zero critical bugs
@@ -429,7 +542,7 @@ class WasmBackend(ExecutionBackend):
 ### Phase 2: Internal Beta (Months 3-4)
 
 **Goals:**
-- Expand to all 3 internal teams (Notebooks, Streamlit, Cortex)
+- Expand to all 4 internal teams (Notebooks vNext, Streamlit vNext, ML Platform, OpenFlow)
 - Add GPU support (A10G)
 - Implement auto-scaling
 
@@ -439,10 +552,17 @@ class WasmBackend(ExecutionBackend):
 - Cost attribution and dashboards
 - Increase to 50 functions per team
 
+**Beta Teams (All 4):**
+- **Notebooks vNext** - Notebook kernels, GPU sessions
+- **Streamlit vNext** - Streamlit apps, dashboards
+- **ML Platform** - Model inference, training jobs
+- **OpenFlow** - Workflow task execution
+
 **Success Criteria:**
-- 50+ functions deployed across 3 teams
-- GPU functions running (Cortex team)
+- 50+ functions deployed across 4 teams
+- GPU functions running (ML Platform team with A10G)
 - Auto-scaling working (0→10→0 instances)
+- OpenFlow workflow integration working
 - 80%+ developer satisfaction
 
 ### Phase 3: Internal GA (Months 5-6)
@@ -459,9 +579,10 @@ class WasmBackend(ExecutionBackend):
 - SLA enforcement (99.9% uptime)
 
 **Success Criteria:**
-- 80%+ of internal workloads migrated
+- 80%+ of internal workloads migrated (across all 4 teams)
 - <5 critical incidents/month
 - 90%+ developer satisfaction
+- $1.3M/year cost savings achieved (6,400 hours × $200/hour)
 - $1.4M/year cost savings achieved
 
 ### Phase 4: Customer Preview (Months 7-8)
@@ -572,9 +693,10 @@ class WasmBackend(ExecutionBackend):
 | Question | Recommendation |
 |----------|----------------|
 | **OpenFlow integration timing** | Phase 3 (Month 5-6) - after internal GA |
-| **Notebooks migration strategy** | Gradual (20% → 50% → 80% over 3 months) |
-| **Streamlit backward compatibility** | Maintain existing SPCS path for 12 months |
-| **Cortex GPU priority** | A10G in Phase 2, H100 in Phase 3 |
+| **Notebooks vNext migration strategy** | Gradual (20% → 50% → 80% over 3 months), focus on new notebooks first |
+| **Streamlit vNext backward compatibility** | Maintain existing SPCS path for 12 months, deprecate feature flags |
+| **ML Platform GPU priority** | A10G in Phase 2, H100 in Phase 3 |
+| **ML Platform image build optimization** | Cache layers aggressively, 3-5 min → <1 min target |
 
 ---
 
@@ -584,10 +706,10 @@ class WasmBackend(ExecutionBackend):
 
 | Metric | Target | Measurement |
 |--------|--------|-------------|
-| Internal team adoption | 80% by Month 6 | % of workloads using serverless |
-| Function count | 100+ by Month 6 | Total deployed functions |
-| Daily active functions | 50+ by Month 6 | Functions invoked in last 24h |
-| Team satisfaction | 90%+ by Month 6 | Quarterly survey (NPS) |
+| Internal team adoption | 80% by Month 6 (4 teams) | % of workloads using serverless |
+| Function count | 150+ by Month 6 | Total deployed functions across all teams |
+| Daily active functions | 75+ by Month 6 | Functions invoked in last 24h |
+| Team satisfaction | 90%+ by Month 6 | Quarterly survey (NPS) across Notebooks vNext, Streamlit vNext, ML, OpenFlow |
 
 ### 10.2 Performance Metrics
 
@@ -603,9 +725,9 @@ class WasmBackend(ExecutionBackend):
 | Metric | Target | Measurement |
 |--------|--------|-------------|
 | Code reduction | 90% | Lines of infra code before/after |
-| Engineering time saved | 240 hours/month | Time tracking by teams |
-| Feature velocity | 67% increase | Features shipped per quarter |
-| Cost savings | $1.4M/year | Engineering cost × time saved |
+| Engineering time saved | 320 hours/month | Time tracking by 4 teams (4 teams × 2 eng × 40% time) |
+| Feature velocity | 67% increase | Features shipped per quarter (across all teams) |
+| Cost savings | $1.3M/year | 6,400 hours/year × $200/hour fully loaded cost |
 
 ### 10.4 Financial Metrics
 
@@ -625,8 +747,11 @@ class WasmBackend(ExecutionBackend):
 | Team | Dependency | Impact | Mitigation |
 |------|-----------|--------|-----------|
 | **SPCS Core** | ServiceSpec API, compute pools, image registry | Critical - blocks all work | Early engagement, dedicated liaison |
-| **Platform Eng** | Token management, auth, secrets | Critical - blocks Phase 1 | Reuse existing patterns |
-| **OpenFlow** | Workflow integration API | Medium - blocks Phase 3 | Can proceed without, adds value |
+| **Platform Eng** | Token management, auth, secrets | Critical - blocks Phase 1 | Reuse existing patterns, automatic refresh |
+| **OpenFlow** | Workflow integration API | Medium - blocks Phase 3 only | Can proceed with other teams, adds value in Phase 3 |
+| **Notebooks vNext** | Testing feedback, migration support | High - primary alpha user | Weekly syncs, dedicated support |
+| **Streamlit vNext** | Feature flag deprecation, bootstrap simplification | High - beta user | Collaborate on managed pattern |
+| **ML Platform** | Image build optimization, resource estimation | High - GPU workflows critical | Joint optimization efforts |
 | **Snowsight** | Cost dashboard, logs UI | Low - nice to have | Use existing Snowsight components |
 
 ### 11.2 External Dependencies
